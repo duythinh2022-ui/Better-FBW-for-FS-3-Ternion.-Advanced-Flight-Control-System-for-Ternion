@@ -54,6 +54,18 @@ namespace Ternion_FS3.FCS
 
 		private static ConfigEntry<bool> cTelemetry;
 
+		private static ConfigEntry<bool> cEstThreaded;
+
+		private static ConfigEntry<bool> cTickTimer;
+
+		private static ConfigEntry<bool> cParTables;
+
+		private static ConfigEntry<bool> cParAlloc;
+
+		private static ConfigEntry<bool> cParSweep;
+
+		private static ConfigEntry<bool> cParEnv;
+
 		private static ConfigEntry<bool> cAIFcs;
 
 		private static ConfigEntry<bool> cAILog;
@@ -778,6 +790,22 @@ namespace Ternion_FS3.FCS
 
 		public static bool TelemetryEnabled => cTelemetry.Value;
 
+		// 3.0.4
+		public static bool EstimatorThreaded => cEstThreaded == null || cEstThreaded.Value;
+
+		public static bool TickTimerLog => cTickTimer == null || cTickTimer.Value;
+
+		// 3.1.0
+		public static bool ParallelTables => cParTables == null || cParTables.Value;
+
+		public static bool ParallelAllocator => cParAlloc == null || cParAlloc.Value;
+
+		// 3.1.2
+		public static bool ParallelSweep => cParSweep == null || cParSweep.Value;
+
+		// 3.1.3
+		public static bool ParallelEnvelope => cParEnv == null || cParEnv.Value;
+
 		public static bool AIFlightControl => cAIFcs.Value;
 
 		public static bool AIFlightLog => cAILog.Value;
@@ -1221,6 +1249,16 @@ namespace Ternion_FS3.FCS
 
 		private static ConfigEntry<bool> cEngAbGate;
 
+		private static ConfigEntry<bool> cEngOutZero;
+
+		private static ConfigEntry<float> cEngOutMatchAoA;
+
+		private static ConfigEntry<bool> cSpinRec;
+
+		private static ConfigEntry<bool> cKeepTail;
+
+		private static ConfigEntry<bool> cSpinIdle;
+
 		private static ConfigEntry<int> cStickRev;
 
 		private static ConfigEntry<float> cStick24;
@@ -1295,6 +1333,16 @@ namespace Ternion_FS3.FCS
 		public static float ThrottleResponseScale => (cThrResp != null) ? Mathf.Clamp(cThrResp.Value, 0.25f, 4f) : 1f;
 
 		public static bool EngineAbAoAGate => cEngAbGate == null || cEngAbGate.Value;
+
+		public static bool EngineOutZeroThrust => cEngOutZero == null || cEngOutZero.Value;
+
+		public static float EngineOutMatchAoA => (cEngOutMatchAoA != null) ? Mathf.Clamp(cEngOutMatchAoA.Value, 5f, 70f) : 35f;
+
+		public static bool SpinRecoveryOn => cSpinRec == null || cSpinRec.Value;
+
+		public static bool EngineKeepsTail => cKeepTail == null || cKeepTail.Value;
+
+		public static bool SpinRecoveryIdle => cSpinIdle == null || cSpinIdle.Value;
 
 		public static float StickAoA24 => Mathf.Clamp(cStick24.Value, 0.0833f, 0.7f);
 
@@ -1592,6 +1640,11 @@ namespace Ternion_FS3.FCS
 			cEngDmgCap = dev.Bind("Asymmetric load", "EngineDamagedAoACap", 40f, "Ifrit 0.4.2: 40 (first 0.4.1 / 2.4.1 cut: 30, the engine-out cap; a running engine's split is a third to a half of a dead one's, and below the speed where the fins could not hold it the thrust match now takes over on prediction, so the cap only says where the full split is traded for matched thrust). Ifrit 0.4.1: with one engine running weak (damaged, not destroyed: under 85 % of the other's thrust, released above 92 %, 1 s filter) the AoA limit is this fixed value, both signs, instead of the dynamic thrust cap (which fell to 12 deg within 5 s in the 22 Oct 22:08 log and then followed IAS). The dead-engine case keeps EngineOutAoACap. The game caps a damaged engine at 50-100 % of its RPM range by its condition (no afterburner below condition ~0.6), so the weak engine makes 35-75 % of the good one's thrust at AB. Bench, full pulls from 300-400 km/h with the left engine at condition 0 / 0.5: 26-30 hold with 5-8 deg peak sideslip, 36 saturates the yaw once the speed is gone (throttle cut a third of the time, one departure), 45 departs.");
 			cThrResp = dev.Bind("5. Airframe", "ThrottleResponseScale", 1f, "Ifrit 0.4.1: throttle response (Ifrit 0.4.5: back to the game's own, 1) for every variant (Stock included): the engines' spool rate (RPM per second toward the throttle's target) and the afterburner's light-up / fade speed are multiplied by this at the airframe setup. 1 = the mod's own values.");
 			cEngAbGate = dev.Bind("Asymmetric load", "EngineAbAoAGate", true, "Ifrit 0.4.1: thrust-match limiter. With one engine down on thrust (predicted from the engines' damage state: an engine's reachable RPM is minRPM + (maxRPM - minRPM) x (0.5 x condition + 0.5), the dry thrust follows the RPM and the afterburner needs 85 % of maxRPM, i.e. condition above 0.55) and the AoA above EngineDamagedAoACap, the throttle input is held where the two engines still make the same thrust, so there is no thrust split and no AoA cap for it: you keep the full AoA, and the thrust comes back once you bring the AoA down to the cap yourself (on above cap + 2, off under cap + 0.5). Below the cap the throttle is free; the thrust split then brings the fixed EngineDamagedAoACap. With an engine OUT there is nothing to match: above EngineOutAoACap the throttle is held at military power (the afterburner's start). The VMC throttle protection (measured sideslip run-away) stays as the last resort. false = 0.4.0 (dynamic cap from the thrust split, nose pushed down).");
+			cEngOutMatchAoA = dev.Bind("Asymmetric load", "EngineOutMatchAoA", 35f, "Ternion 0.1.11: with an engine destroyed, the live engine is matched to it (zero thrust) from this AoA up (default 35; timed to be complete as the AoA gets here), and at any AoA once the yaw saturates; it stays matched until the AoA is 5 deg under this and the yaw has settled. EngineOutAoACap no longer sets this point (0.1.9 / 0.1.10 used it: at 55 the match let go while the jet sat at 40-50 deg with the stick held and the thrust yaw came back). No AoA limit comes from the engine loss.");
+			cEngOutZero = dev.Bind("Asymmetric load", "EngineOutZeroThrust", true, "Ternion 0.1.9: with an engine OUT (destroyed), the AoA is not capped for it (EngineOutAoACap is no longer a limit): from EngineOutAoACap up, in every mode including MPO, the live engine is matched to the dead one - zero thrust (its afterburner off) - timed to be complete before the AoA gets there, and on the VMC run-away at any AoA; the thrust comes back as the AoA comes back down under EngineOutAoACap. Bench, left engine out, full pulls from 350 / 500 km/h: 55 deg reached with 0.8 deg of sideslip; MPO pulls past 90 deg: 0.3-0.5 deg of sideslip (0.1.8, live engine held at military power: 7-19 deg). false = 0.1.8 (AoA capped at EngineOutAoACap, live engine held at military power above it).");
+			cKeepTail = dev.Bind("Asymmetric load", "EngineLossKeepsTail", true, "Ternion 0.1.10: in the FS-3 Ternion blueprint the wing root panel behind each engine (wing_1c, which carries that side's elevator, fin and rudder) hangs off the engine nacelle, so the game took the whole tail section with a destroyed engine (mass -3.5 t, that side's elevator and rudder frozen). The blueprint also joins wing_1c to the inboard wing panel; at spawn the panel is re-homed onto that panel, so a destroyed engine is only the engine. Applies to the next spawn. false = the blueprint as it is.");
+			cSpinIdle = dev.Bind("2. Envelope", "SpinRecoveryIdle", true, "Ternion 0.1.10: the spin recovery also pulls both throttles to idle while it runs (bench, right flaperons + stab gone: with the afterburner on the nose came back up after the recovery and the jet spun again). This is the throttle cut you see with healthy engines - not the engine-out VMC logic. false = the throttle stays where you put it.");
+			cSpinRec = dev.Bind("2. Envelope", "SpinRecovery", true, "Ternion 0.1.9: automatic spin recovery. With the AoA past 40 deg and a yaw rate past 15 deg/s for 0.8 s while the lateral stick and pedal are centred and the pitch stick is not held aft, the controller asks every surface for full nose-down and full yaw against the rotation with the roll rate damped, and the throttle goes to idle, until the AoA is under 30 and the yaw rate under 10 deg/s (or you put lateral input in). Any mode, MPO included. Bench, right flaperons + right stab gone, MPO pulls released past 100 deg: 7 of 8 cases out for good 9-13 s after it engaged; one (idle, released after a push) kept re-entering for 40 s (0.1.8: none recovered). It also flies out a clean jet left rotating at 100+ deg AoA below ~450 km/h after you let go in MPO. false = off.");
 			cFuelTrim = dev.Bind("6. Fuel", "FuelTrim", defaultValue: true, "2.0.12: when the yaw or roll authority runs short (an engine out, a fin or wing section shot off), the balancing moves the CG sideways with fuel instead of holding it on the centreline: toward the live engine to shorten its thrust lever arm, or against an aerodynamic asymmetry. Only once the yaw or roll usage passes 0.75, only as far as evens out the roll and yaw usage (a sideways CG costs roll: ~15 deg/s^2 per g per 10 cm), at most 30 cm; back to the centreline once both are under 0.5 for 2 s. false = centreline always (2.0.6-2.0.11).");
 			cFuelTrimRate = dev.Bind("6. Fuel", "FuelTrimRate", 240f, "2.0.12: fuel moved per second (kg/s, in total) while the fuel trim works (normal balancing: FuelTransferRate). Ifrit 0.4.1: 240 (was 120).");
 			cFuelRate = dev.Bind("6. Fuel", "FuelTransferRate", 80f, "2.0.6: total fuel the balancing moves per second (kg/s). Ifrit 0.4.1: 80 (was 40).");
@@ -1610,6 +1663,12 @@ namespace Ternion_FS3.FCS
 			cTelemetry = dev.Bind("0. Debug", "Telemetry", defaultValue: false, "Write a 50 Hz CSV of the FCS state to BepInEx/Ifrit_FCS_<time>.csv.");
 			cAIFcs = cfg.Bind("2. AI", "AIFlightControl", defaultValue: false, "Off by default (every AI Ternion in a mission would otherwise fly this FCS). true = AI-flown Ternions simulated on this machine (no human pilot) get the full FCS with a pitch-rate command law (the AI's stick is a pitch-rate command; AoA/G protection, coordination and the allocator as for a player). Takes effect at the next spawn. Experimental.");
 			cAILog = dev.Bind("0. Debug", "AIFlightLog", defaultValue: false, "Every 20 s, log one summary line per AI F-22E the FCS is flying (mode, IAS, AoA and g range, time in AoA protection), so AI jets can be checked from BepInEx/LogOutput.log after any mission. Each F-22E also logs once which control path it takes when it first reaches the flight-control hook.");
+			cEstThreaded = dev.Bind("0. Debug", "EstimatorThreaded", defaultValue: true, "0.2.0: run the capacity estimator's allocator probes on a worker thread instead of the game's main thread (the laws already read the previous tick's estimate, so the flying is identical). false = on the main thread. Takes effect at once.");
+			cTickTimer = dev.Bind("0. Debug", "TickTimerLog", defaultValue: true, "0.2.0: every 10 s, log the FCS's main-thread time per physics tick to BepInEx/LogOutput.log (player jet: mean / median / p95 / max and the split by phase; AI jets together; the airframe force hooks). Drives nothing.");
+			cParTables = dev.Bind("0. Debug", "ParallelTables", defaultValue: true, "0.2.0: the surfaces' moment tables (rebuilt every physics tick) are computed on several cores: the game's objects are read on the main thread, the table maths runs on the shared thread pool. Identical results either way. false = one thread. Takes effect at once.");
+			cParAlloc = dev.Bind("0. Debug", "ParallelAllocator", defaultValue: true, "0.2.0: when the allocator's two-horizon pick is active, its third solve (the reach plan) runs on a second core while the main thread does the other two. Identical results either way. false = one thread. Takes effect at once.");
+			cParSweep = dev.Bind("0. Debug", "ParallelSweep", defaultValue: true, "0.2.0: the asymmetric-load sweep (an AoA sweep of the whole airframe, a few points per physics tick) reads the parts' state once and computes its points on several cores. Identical results either way. false = one thread. Takes effect at once.");
+			cParEnv = dev.Bind("0. Debug", "ParallelEnvelope", defaultValue: true, "0.2.0: the lift envelope (25 AoA points over every airframe part) and the hybrid pitch slopes, refreshed every 0.1 s, read the parts' state once and compute their points on several cores. Identical results either way. false = one thread. Takes effect at once.");
 			cAIDirectRoll = cfg.Bind("2. AI", "AIDirectRoll", defaultValue: true, "AI Ternions only: the AI's roll stick drives the velocity-vector roll rate almost directly (up to the jet's roll authority, still capped by the roll limits).");
 			cAIGunRollFade = cfg.Bind("2. AI", "AIGunRollFade", defaultValue: true, "AI Ternions only: while the AI points its nose (guns) at a moving target, its roll stick is faded out when the aim error is small, so it does not wobble the gun solution.");
 			cAoAPos = dev.Bind("2. Envelope", "AoALimitPositive", 55f, "Ternion 0.1.5: 55 (Tom). 0.1.3: 50 (Tom: 50 is a good limit). Bench with LowThrustCapMargin 4: full-aft pulls hold 50 down to ~150-175 km/h; 55 holds to ~165-185 km/h; 60 reaches 58-60 but nothing holds it below ~180 km/h. Ternion 0.1.0: 40 (bench, the highest usable): full-aft pulls from 200-550 km/h hold 40.0 (+-0.04-0.13 deg rms) with the canards at 28-33 of 60 and the elevators at their 35 TE-up stop only below ~250 km/h; loaded rolls at the limit (full aft + full roll and reversal, 250-450 km/h) stay within 39.4-40.8 at 27-29 deg/s velocity-vector roll, sideslip <= 1.6. At 45 the loaded rolls swing 39.6-46.0 and the elevators pin and chatter below 350 km/h; at 50-55 the canards reach their 60 stop and the limit is not held. Below ~180 km/h the authority cap (LowThrustAoACap) takes it lower. AoA limit (deg) in AoA/G command and gear-down rate command.");
@@ -1749,10 +1808,10 @@ namespace Ternion_FS3.FCS
 			// Revoker FCS 0.3.0 (F-22E 2.6.0): the lateral reference governor's knobs live in the player config; PullRollTrade moves here from the Dev file (its value carried over once)
 			cPullRollTrade = cfg.Bind("6. Lateral governor", "PullRollTrade", 0.7f, "2.2.8 (2.2.23: default 0 -> 0.7; 2.2.26: 1; 2.2.27: back to 0.7): in a rolling pull the yaw cannot keep up with, how much of the shortfall is paid by slowing the roll and how much by slowing the AoA rise (the sideslip a rising AoA makes goes as roll rate x AoA rate). 0 = roll kept, AoA rise limited. 1 = roll slowed (to no less than 30 deg/s) until the asked AoA rise fits; in between, the roll limit goes that share of the way and the pitch covers the rest (F-22E 2.6.4/2.6.5). The roll comes back once the AoA rise is no longer limited. Takes effect at once.");
 			cRollStopSlip = cfg.Bind("6. Lateral governor", "RollStopSideslip", 6f, "Revoker FCS 0.7.0: default 8 -> 6 (Tom, 5 Nov 01:10: roll reversals at low to mid AoA made 7-9 deg, the margin spent in every one; 2 deg less, at some roll rate there). Revoker FCS 0.4.0: default 8 (the F-22E flies 4). From your 30-31 Oct logs the old lateral stack ran this jet at 7-8 deg (95th percentile) of sideslip above 45 deg AoA and 2.6-3.3 at 15-45, and the rates you were used to came with that; the governor at 4 kept the sideslip to 2-4 and took the yaw rate in the falling leaf from 77 to 54 and the moderate-AoA roll from 64 to 46 deg/s (Revoker 0.3.0 flight). 8 is where this jet was; lower = cleaner stops, slower rolls. F-22E 2.4.17 (2.5.0: 3 -> 4): sideslip (deg) a roll stop or reversal is allowed to make; the lateral governor caps the commanded roll rate (never the roll acceleration or braking) to the rate whose full stick reversal the yaw can follow within it. The one margin at every AoA (no schedule); the airframe probe (RollStopSlipProbe) can only lower it. A handling (sway) number: lower = slower rolls at moderate AoA, cleaner stops. Allowed 1-15. Takes effect at once.");
-			cGovRev = cfg.Bind("6. Lateral governor", "GovernorRevision", 3, "Internal: the lateral-governor default revision this file was last updated to. Leave it alone.");
+			cGovRev = cfg.Bind("6. Lateral governor", "GovernorRevision", 4, "Internal: the lateral-governor default revision this file was last updated to. Leave it alone.");
 			cRollGovPitch = cfg.Bind("6. Lateral governor", "RollGovernorPitch", true, "F-22E 2.5.2, rebuilt 2.5.3-2.6.6: roll first, then pitch, both ways. With the roll already held to its cap, the AoA rate the pitch law may command under the roll is held to what the yaw can pay for: an AoA sweep changes the yaw the pair needs at roll rate x cos AoA x AoA rate. Nose-up at positive AoA: 0.8 x the rudders' braking yaw not yet in use on the roll's side, faded in with the rudders' braking yaw and only as the forecast sideslip heads past 75 % of the margin - a rolling pull that pins the rudders but holds its sideslip keeps its pitch rate. Every other sweep (nose-down anywhere, nose-up from negative AoA): 0.5 x the yaw authority plus half the roll's, from the same rule, at every IAS; a sweep toward zero AoA under a body yaw rate is paced so the yaw that will have nothing to coordinate at zero AoA is shed first (weighted by 1 - cos AoA, so the nose is let through near zero). Never under 6 deg/s of AoA rate; released over 0.3 s. false = the trade alone. Takes effect at once.");
 			cRollPaceRateSlip = cfg.Bind("6. Lateral governor", "RollPaceRateSlip", 1f, new ConfigDescription("F-22E 2.5.10: how much of the sideslip margin the roll-rate cap spends - the roll rate / sideslip compromise. 1 = the cap aims a full stick reversal at the margin as set. Above 1 the cap aims past the margin and lets the roll run faster (F-22E bench, margin 15: worst / mean sideslip and mean roll rate 5.8 / 3.9 at 52 deg/s for 1.0, 8.3 / 4.8 at 59 for 1.25, 10.7 / 6.3 at 67 for 1.67, 13.0 / 7.6 at 74 for 2.0, against 10.9 / 8.0 at 83 with no cap); the game's worst held-roll reversal reads about 1.4x the bench's. Below 1 the cap is stricter than the margin. Allowed 0.5-3. Takes effect at once.", new AcceptableValueRange<float>(0.5f, 3f)));
-			cRollPaceRateBlend = cfg.Bind("6. Lateral governor", "RollPaceRateBlend", 0.65f, new ConfigDescription("Revoker FCS 0.8.1: default 0.4 -> 0.65 (Tom, 5 Nov 01:40: low to mid AoA roll sideslip somewhere between 0.5.1 and 0.8.0). F-22E 2.5.11: how the pace governor splits its work between its two laws. 0 = pacing only (the yaw-reach window holds the roll target while the yaw catches up and the trajectory's acceleration / braking is capped at the yaw's authority: reversals are paced, the margin does not matter). 1 = rate cap only (the target is capped at the rate whose stick reversal lands on the sideslip margin x RollPaceRateSlip; acceleration and braking stay as tuned: reversals are crisp, the rate is lower). Between: the proportional mix of the two targets, and the acceleration cap gives way to the tuned acceleration in the same proportion. The F-22E flies at ~0.4. Allowed 0-1. Takes effect at once.", new AcceptableValueRange<float>(0f, 1f)));
+			cRollPaceRateBlend = cfg.Bind("6. Lateral governor", "RollPaceRateBlend", 0.45f, new ConfigDescription("Ternion 0.1.11: default 0.65 -> 0.45 (Tom, 9 Nov). Revoker FCS 0.8.1: default 0.4 -> 0.65 (Tom, 5 Nov 01:40: low to mid AoA roll sideslip somewhere between 0.5.1 and 0.8.0). F-22E 2.5.11: how the pace governor splits its work between its two laws. 0 = pacing only (the yaw-reach window holds the roll target while the yaw catches up and the trajectory's acceleration / braking is capped at the yaw's authority: reversals are paced, the margin does not matter). 1 = rate cap only (the target is capped at the rate whose stick reversal lands on the sideslip margin x RollPaceRateSlip; acceleration and braking stay as tuned: reversals are crisp, the rate is lower). Between: the proportional mix of the two targets, and the acceleration cap gives way to the tuned acceleration in the same proportion. The F-22E flies at ~0.4. Allowed 0-1. Takes effect at once.", new AcceptableValueRange<float>(0f, 1f)));
 			cRollStopSlipProbe = cfg.Bind("6. Lateral governor", "RollStopSlipProbe", true, "F-22E 2.5.15/2.5.16: the airframe's own sideslip tolerance, measured from its aero tables in flight - no number entered. Twice a second the FCS evaluates the whole airframe (every aero part at the game's per-part law, the surfaces where they are) at the present AoA and a sweep of hypothetical sideslip to 20 deg each way, and finds the sideslip where the restoring yaw moment stops growing (directional stiffness gone - the departure boundary) and where the yaw effectors' or the roll surfaces' authority has fallen to half of its zero-sideslip value. The smaller, x 0.7, caps RollStopSideslip. On an airframe with nothing inside 20 deg the cap never binds and RollStopSideslip rules; on one with a soft fin it binds where the fin gives out. Telemetry: slipTol / slipDep / slipAuth / slipStiff. false = RollStopSideslip alone. Takes effect at once.");
 			cPushSlip = cfg.Bind("6. Lateral governor", "PushoverSideslip", 8f, "Revoker 0.6.0 (the F-22E 3.0.0 push governor and push plan): 8, set explicitly (Tom, 4 Nov: the stock jets' RollStopSideslip, not the F-22E's 4); -1 = follow RollStopSideslip. F-22E 2.9.4: sideslip (deg) a push-over from high AoA may make at the zero crossing from the yaw rate still on board. The sweep is paced so the yaw above what that allowance can absorb (r = sqrt(2 x measured shed x allowance)) is shed before the AoA reaches zero; the rest is left to the rudders at low AoA. Higher = faster nose-down with a high yaw rate on, more sideslip at the bottom. -1 = RollStopSideslip. 0-20. Takes effect at once.");
 			if (cStickRev.Value < 1)
@@ -2323,6 +2382,18 @@ namespace Ternion_FS3.FCS
 				cfg.Save();
 				Log.LogInfo($"Revoker FCS 0.8.1 defaults: RollPaceRateBlend {cRollPaceRateBlend.Value} (0.4 -> 0.65 unless set by hand).");
 			}
+			// Ternion 0.1.11: RollPaceRateBlend default 0.65 -> 0.45 (Tom, 9 Nov: "set rollpaceblend as 45% as default"); a file holding
+			// 0.65 or 0.4 (either old default) is moved once, any other value set by hand is kept
+			if (cGovRev.Value < 4)
+			{
+				if (Mathf.Abs(cRollPaceRateBlend.Value - 0.65f) < 0.0001f || Mathf.Abs(cRollPaceRateBlend.Value - 0.4f) < 0.0001f)
+				{
+					cRollPaceRateBlend.Value = 0.45f;
+				}
+				cGovRev.Value = 4;
+				cfg.Save();
+				Log.LogInfo($"Ternion FCS 0.1.11 defaults: RollPaceRateBlend {cRollPaceRateBlend.Value} (0.65 -> 0.45 unless set by hand).");
+			}
 			// Ifrit 0.2.0: 0.1.0 ran the F-22E 2.0.3 airframe migration and wrote 1.2 into the (unused) effectiveness keys; reset
 			// them once. The Ifrit airframe is never effectiveness-scaled.
 			// Ifrit 0.2.1: the rollout aero-brake is off; the split decelerons are the airbrake on the ground too
@@ -2781,6 +2852,12 @@ namespace Ternion_FS3.FCS
 		public static void ApplyPatches(Harmony h)
 		{
 			MpPolicy.Install(h, (string what, Action a) => TryPatch(h, what, a));
+			TryPatch(h, "UnitPart.UnitPart_OnParentDetached", delegate
+			{
+				HarmonyMethod pre = new HarmonyMethod(typeof(StructureFix), "OnParentDetachedPrefix");
+				h.Patch(AccessTools.Method(typeof(UnitPart), "UnitPart_OnParentDetached", new Type[1] { typeof(UnitPart) }), pre);
+				h.Patch(AccessTools.Method(typeof(AeroPart), "UnitPart_OnParentDetached", new Type[1] { typeof(UnitPart) }), pre);
+			});
 			TryPatch(h, "ControlsFilter.Filter", delegate
 			{
 				h.Patch(AccessTools.Method(typeof(ControlsFilter), "Filter"), new HarmonyMethod(typeof(Hooks), "FilterPrefix"));

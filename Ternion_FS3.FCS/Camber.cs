@@ -115,6 +115,14 @@ namespace Ternion_FS3.FCS
 			return Foil(v, r1, t, qS) - Foil(v, hostRot, t, qS);
 		}
 
+		// F-22E 3.1.3: Delta with its undeflected half (Foil(v, hostRot, t, qS)) passed in, for callers that evaluate several
+		// deflections in one flow; the caller has applied Delta's zero test (k <= 0 or |delta| < 0.01)
+		public static Vector3 DeltaFrom(Vector3 baseF, Vector3 v, Quaternion hostRot, Vector3 hingeAxis, float k, float delta, AirfoilTable t, float qS)
+		{
+			Quaternion r1 = Quaternion.AngleAxis(k * delta, hingeAxis) * hostRot;
+			return Foil(v, r1, t, qS) - baseF;
+		}
+
 		// a control surface's current deflection about its hinge (deg), from the visible mesh vs its resting rotation
 		public static float DeflectionOf(Transform visible, Quaternion resting)
 		{

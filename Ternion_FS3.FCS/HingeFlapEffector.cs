@@ -217,6 +217,82 @@ namespace Ternion_FS3.FCS
 		public Quaternion HostRot0 => (hostLN != null) ? (((hostLN.parent != null) ? hostLN.parent.rotation : Quaternion.identity) * hostRest) : Quaternion.identity;
 
 		// this flap's moment (and its host camber increment) at deflection delta in a given flow, as SurfaceEffector.EvalFlow
+		// perf port: EvalFlow for the asymmetric-load sweep's worker threads. The game objects it reads (the parent and host transforms,
+		// the rigidbodies, the config) are read once per sweep tick on the main thread (Snap); EvalFlowSnap is EvalFlow on those values,
+		// the same expressions in the same order, and touches no Unity object.
+		internal struct FlowSnap
+		{
+			public bool ok;
+			public Quaternion r0;
+			public Vector3 com;
+			public Vector3 col;
+			public float area;
+			public float eff;
+			public bool hostOk;
+			public Quaternion h0;
+			public Vector3 hostCom;
+			public Vector3 hostCol;
+			public float hArea;
+			public float hEff;
+			public float camberK;
+		}
+
+		internal void Snap(out FlowSnap s)
+		{
+			s = default(FlowSnap);
+			if (foil == null || part == null || part.rb == null)
+			{
+				return;
+			}
+			s.ok = true;
+			Transform par = vis.parent;
+			s.r0 = ((par != null) ? par.rotation : Quaternion.identity) * visRest;
+			s.com = part.rb.worldCenterOfMass;
+			s.col = Acc.AP_centerOfLift(part);
+			s.area = Acc.AP_wingArea(part);
+			s.eff = Acc.AP_wingEff(part);
+			if (host != null && hostLN != null && hostFoil != null && host.rb != null && !host.IsDetached() && Plugin.FlapCamberK > 0f)
+			{
+				s.hostOk = true;
+				s.h0 = HostRot0;
+				s.hostCom = host.rb.worldCenterOfMass;
+				s.hostCol = Acc.AP_centerOfLift(host);
+				s.hArea = Acc.AP_wingArea(host);
+				s.hEff = Acc.AP_wingEff(host);
+				s.camberK = Plugin.FlapCamberK;
+			}
+		}
+
+		internal Vector3 EvalFlowSnap(float delta, Vector3 vFlow, float rho, ref EvalContext ctx, ref FlowSnap s)
+		{
+			float sq = vFlow.sqrMagnitude;
+			if (sq < 1f || !s.ok)
+			{
+				return Vector3.zero;
+			}
+			Quaternion r0 = s.r0;
+			Quaternion q = r0 * Quaternion.AngleAxis(delta, Vector3.right);
+			Vector3 vl = Quaternion.Inverse(q) * vFlow;
+			foil.Get(Mathf.Atan2(vl.y, vl.z), out var CL, out var CD);
+			Vector3 n = Vector3.Cross(vFlow, q * Vector3.right);
+			float m = n.magnitude;
+			if (m < 0.0001f)
+			{
+				return Vector3.zero;
+			}
+			float qs = 0.5f * rho * sq * s.area * s.eff;
+			Vector3 f = -n / m * (CL * qs) - vFlow / Mathf.Sqrt(sq) * (CD * qs);
+			Vector3 mF = Vector3.Cross(s.com + q * s.col - ctx.cg, f);
+			if (s.hostOk)
+			{
+				Quaternion h0 = s.h0;
+				float hq = 0.5f * rho * sq * s.hArea * s.hEff;
+				Vector3 dH = Camber.Delta(vFlow, h0, r0 * Vector3.right, s.camberK, delta, hostFoil, hq);
+				mF += Vector3.Cross(s.hostCom + h0 * s.hostCol - ctx.cg, dH);
+			}
+			return ToAero(ctx.rootInv, mF);
+		}
+
 		public Vector3 EvalFlow(float delta, Vector3 vFlow, float rho, ref EvalContext ctx)
 		{
 			float sq = vFlow.sqrMagnitude;

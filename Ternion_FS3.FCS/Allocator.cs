@@ -58,6 +58,9 @@ namespace Ternion_FS3.FCS
 
 		private double fightSignHint;
 
+		// Ternion 0.1.9: set by the controller while a roll surface has lost its mirror partner (no target reference then)
+		public bool fightHintOff;
+
 		private readonly double[] grR = new double[FightGroups + 1];
 
 		private readonly bool[] grOn = new bool[FightGroups + 1];
@@ -122,6 +125,36 @@ namespace Ternion_FS3.FCS
 		public float slipSin;
 
 		public float slipCos = 1f;
+
+		// F-22E 3.0.4 (EstimatorJob): the worker's allocator takes the main one's configuration (everything a solve reads that is not
+		// static and not rebuilt inside the solve); scratch arrays, counters, resDbg and lastCost stay its own
+		internal void CopyConfigFrom(Allocator s)
+		{
+			axisWeight = s.axisWeight;
+			gnIterations = s.gnIterations;
+			regScale = s.regScale;
+			fightK = s.fightK;
+			for (int i = 0; i < fightW.Length; i++)
+			{
+				fightW[i] = s.fightW[i];
+			}
+			pitchFightK = s.pitchFightK;
+			pitchFightSign = s.pitchFightSign;
+			i00 = s.i00;
+			i01 = s.i01;
+			i02 = s.i02;
+			i10 = s.i10;
+			i11 = s.i11;
+			i12 = s.i12;
+			i20 = s.i20;
+			i21 = s.i21;
+			i22 = s.i22;
+			PairedTrimSearch = s.PairedTrimSearch;
+			slipFrame = s.slipFrame;   // this jet's own solve configuration (set by the controller each tick)
+			slipSin = s.slipSin;   // this jet's own solve configuration (set by the controller each tick)
+			slipCos = s.slipCos;   // this jet's own solve configuration (set by the controller each tick)
+			fightHintOff = s.fightHintOff;   // this jet's own solve configuration (set by the controller each tick)
+		}
 
 		private Vector3 E(Vector3 m)
 		{
@@ -422,7 +455,32 @@ namespace Ternion_FS3.FCS
 
 		public float lastCost;
 
+		// F-22E 3.1.0: the main allocator times its solves (per-phase timer) and may run the two-horizon reach plan on a worker
+		public bool timeSolves;
+
+		public long solveTicks;
+
+		internal bool parallelReach;
+
 		public void Solve(List<Effector> effs, Vector3 target)
+		{
+			if (!timeSolves)
+			{
+				SolveInner(effs, target);
+				return;
+			}
+			long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+			try
+			{
+				SolveInner(effs, target);
+			}
+			finally
+			{
+				solveTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+			}
+		}
+
+		private void SolveInner(List<Effector> effs, Vector3 target)
 		{
 			bool any = false;
 			if (ReachPass)
@@ -437,6 +495,14 @@ namespace Ternion_FS3.FCS
 				SolveCore(effs, target);
 				return;
 			}
+			// F-22E 3.1.0 (ParallelAllocator): the reach plan below depends only on the commands before this solve, so it can start now,
+			// on copies, while this thread does the destination solve and the reach pass. Started only when the last solve needed the
+			// two-horizon pick (it comes in runs during manoeuvres); otherwise, or if no copy set is free, the sequential path below.
+			ReachJob rj = null;
+			if (parallelReach && TwoHorizon && ParallelReachOn && lastNeededPick)
+			{
+				rj = KickReach(effs, target);
+			}
 			rchAll.Clear();
 			rchCmd0.Clear();
 			foreach (Effector e in effs)
@@ -447,6 +513,7 @@ namespace Ternion_FS3.FCS
 			SolveCore(effs, target);
 			if (!TwoHorizon)
 			{
+				rj?.Drop();
 				ReachFrom(effs, target);
 				return;
 			}
@@ -457,10 +524,21 @@ namespace Ternion_FS3.FCS
 			// The near horizon alone is the 1.8.14 stab rate bound; the far one alone, the 2.41 reach pass.
 			float jD = lastCost;
 			ReachFrom(effs, target);
-			if (rchE.Count == 0) return;
+			if (rchE.Count == 0)
+			{
+				rj?.Drop();
+				lastNeededPick = false;
+				return;
+			}
 			bool anyTH = false;
 			foreach (Effector e in rchE) if (e.twoHorizon) anyTH = true;
-			if (!anyTH) return;
+			if (!anyTH)
+			{
+				rj?.Drop();
+				lastNeededPick = false;
+				return;
+			}
+			lastNeededPick = true;
 			float jR = lastCost;
 			thR.Clear();
 			foreach (Effector e in effs) thR.Add(e.cmd);
@@ -479,6 +557,28 @@ namespace Ternion_FS3.FCS
 					acc += Cost(tot - target);
 				}
 				jR = Mathf.Max(jR, acc / 8f);
+			}
+			if (rj != null)
+			{
+				// the reach plan from the worker: its cost, its residual and its commands, exactly as the sequential solve below leaves them
+				rj.Join();
+				reachUsed++;
+				ReachUsedTotal++;
+				float jBw = rj.cost;
+				lastCost = jBw;
+				resDbg = rj.resDbg;
+				coordNewtonMoves += rj.coordMoves;
+				pairedMoves += rj.pairMoves;
+				if (2f * jBw <= jR + jD)
+				{
+					twoHorizonBound++;
+					ReachPickedTotal++;
+					List<Effector> we = rj.mirror.effs;
+					for (int i = 0; i < rchAll.Count; i++) rchAll[i].cmd = we[i].cmd;
+					return;
+				}
+				for (int i = 0; i < rchAll.Count; i++) rchAll[i].cmd = thR[i];
+				return;
 			}
 			thLo.Clear(); thHi.Clear();
 			for (int i = 0; i < rchAll.Count; i++)
@@ -502,6 +602,89 @@ namespace Ternion_FS3.FCS
 				return;   // the reach plan's commands are in place
 			}
 			for (int i = 0; i < rchAll.Count; i++) rchAll[i].cmd = thR[i];
+		}
+
+		// ---- F-22E 3.1.0 (ParallelAllocator): the two-horizon reach plan on a worker
+		public static bool ParallelReachOn = true;
+
+		private bool lastNeededPick;
+
+		private ReachJob[] reachJobs;   // created on first use (main allocator only: a mirror allocator never runs a reach plan in parallel)
+
+		public int reachKicks, reachUsed;
+
+		public static int ReachKicksTotal, ReachUsedTotal, ReachPickedTotal;   // bench / diagnostics (main thread only)
+
+		private ReachJob KickReach(List<Effector> effs, Vector3 target)
+		{
+			if (reachJobs == null)
+			{
+				reachJobs = new ReachJob[] { new ReachJob(), new ReachJob() };
+			}
+			foreach (ReachJob j in reachJobs)
+			{
+				if (j.Idle)
+				{
+					j.Start(effs, this, target);
+					reachKicks++;
+					ReachKicksTotal++;
+					return j;
+				}
+			}
+			return null;
+		}
+
+		// the sequential path's third solve, on the worker's copies: every two-horizon effector bounded to what its servo reaches in
+		// reachTau from where it is, from the commands before this solve
+		private void ReachPlanOn(List<Effector> effs, Vector3 target)
+		{
+			foreach (Effector e in effs)
+			{
+				if (e.active && e.reachTau > 0f && e.twoHorizon)
+				{
+					float reach = Mathf.Max(1f, e.rate) * e.reachTau;
+					float lo = Mathf.Max(e.lo, Mathf.Min(e.now, e.hi) - reach), hi = Mathf.Min(e.hi, Mathf.Max(e.now, e.lo) + reach);
+					if (lo <= hi) { e.lo = lo; e.hi = hi; }
+				}
+			}
+			SolveCore(effs, target);
+		}
+
+		internal sealed class ReachJob : Claimable
+		{
+			public readonly EffectorMirror mirror = new EffectorMirror();
+			private Vector3 tgt;
+			public float cost;
+			public Vector3 resDbg;
+			public int coordMoves, pairMoves;
+
+			public void Start(List<Effector> effs, Allocator main, Vector3 target)
+			{
+				mirror.Sync(effs, main);
+				tgt = target;
+				Queue();
+			}
+
+			protected override void Work()
+			{
+				Allocator a = mirror.alloc;
+				int c0 = a.coordNewtonMoves, p0 = a.pairedMoves;
+				a.ReachPlanOn(mirror.effs, tgt);
+				cost = a.lastCost;
+				resDbg = a.resDbg;
+				coordMoves = a.coordNewtonMoves - c0;
+				pairMoves = a.pairedMoves - p0;
+			}
+
+			public void Join()
+			{
+				JoinCore(out _);
+			}
+
+			public void Drop()
+			{
+				Abandon();
+			}
 		}
 
 		public static bool TwoHorizon = true;
@@ -578,7 +761,7 @@ namespace Ternion_FS3.FCS
 				y0[j] = act[j].MAt(0f).y;
 			}
 			fightSignHint = 0.0;
-			if (fightK > 0f && FightTargetMin > 0f)
+			if (fightK > 0f && FightTargetMin > 0f && !fightHintOff)
 			{
 				double tr = (double)i00 * (double)target.x;
 				for (int jh = 0; jh < count; jh++)

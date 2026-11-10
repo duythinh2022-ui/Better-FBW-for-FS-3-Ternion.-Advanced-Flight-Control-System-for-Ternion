@@ -172,6 +172,13 @@ namespace Ternion_FS3.FCS
 
 		private Vector3 hingeAxis;
 
+		// F-22E 3.1.3: the host's undeflected camber force (Camber.Foil(hostV, hostRot, hostFoil, hostQS)), the same for every table
+		// point of a rebuild; worked out once per rebuild (on whichever thread runs EvalCompute) instead of once per point. Cleared by
+		// EvalGather whenever the host's state is read again.
+		private Vector3 hostBase;
+
+		private bool hostBaseOk;
+
 		public bool Valid
 		{
 			get
@@ -265,18 +272,29 @@ namespace Ternion_FS3.FCS
 			}
 		}
 
+		// F-22E 3.1.0: Evaluate = EvalGather (main thread: reads the game's objects into this effector's fields) + EvalCompute (pure
+		// maths on those fields: the table over the grid, the live moment, the post-processing; safe on a worker, writes only this
+		// effector). The table rebuild runs EvalCompute for the surfaces in parallel (FcsController, ParallelTables); same code, same order.
 		public override void Evaluate(ref EvalContext ctx)
+		{
+			if (EvalGather(ref ctx))
+			{
+				EvalCompute(ref ctx);
+			}
+		}
+
+		internal bool EvalGather(ref EvalContext ctx)
 		{
 			nodeOn = false;
 			active = false;
 			if (!Valid)
 			{
-				return;
+				return false;
 			}
 			ref ControlSurfaceFields reference = ref Acc.Job(cs);
 			if (reference.IsDetached)
 			{
-				return;
+				return false;
 			}
 			Transform transform = Acc.CS_visible(cs).transform;
 			Transform transform2 = Acc.AP_liftNormal(part);
@@ -314,6 +332,7 @@ namespace Ternion_FS3.FCS
 			}
 			qS = 0.5f * ctx.rho * v2 * Acc.AP_wingArea(part) * Acc.AP_wingEff(part);
 			hostK = 0f;
+			hostBaseOk = false;
 			if (host != null && hostFoil != null && host.rb != null && !host.IsDetached())
 			{
 				Transform hlt = Acc.AP_liftNormal(host);
@@ -340,6 +359,11 @@ namespace Ternion_FS3.FCS
 					ApplyAsymRange(teUp);
 				}
 			}
+			return true;
+		}
+
+		internal void EvalCompute(ref EvalContext ctx)
+		{
 			for (int i = 0; i < N; i++)
 			{
 				M[i] = Eval(grid[i], ref ctx, out var _);
@@ -476,7 +500,17 @@ namespace Ternion_FS3.FCS
 			Vector3 fTot = rhs2;
 			if (hostK > 0f)
 			{
-				Vector3 dH = Camber.Delta(hostV, hostRot, hingeAxis, hostK, delta, hostFoil, hostQS);
+				// 3.1.3: Camber.Delta with its undeflected half from the per-rebuild cache (same zero test, same expressions)
+				Vector3 dH = Vector3.zero;
+				if (!(hostK <= 0f) && !(Mathf.Abs(delta) < 0.01f))
+				{
+					if (!hostBaseOk)
+					{
+						hostBase = Camber.Foil(hostV, hostRot, hostFoil, hostQS);
+						hostBaseOk = true;
+					}
+					dH = Camber.DeltaFrom(hostBase, hostV, hostRot, hingeAxis, hostK, delta, hostFoil, hostQS);
+				}
 				mTot += Vector3.Cross(hostCom + hostRot * hostCol - ctx.cg, dH);
 				fTot += dH;
 			}
@@ -513,6 +547,84 @@ namespace Ternion_FS3.FCS
 				float hq = 0.5f * rho * sqrMagnitude * Acc.AP_wingArea(host) * Acc.AP_wingEff(host);
 				Vector3 dH = Camber.Delta(vFlow, hostRot, hingeAxis, hostK, delta, hostFoil, hq);
 				mF += Vector3.Cross(hostCom + hostRot * hostCol - ctx.cg, dH);
+			}
+			return Effector.ToAero(ctx.rootInv, mF);
+		}
+
+		// F-22E 3.1.3: EvalFlow for several deflections in the same flow (the asymmetric-load sweep evaluates a flaperon twice and a
+		// rudder up to four times per AoA point): what depends only on the flow - its magnitude, the stab's downwash turn, the
+		// dynamic pressures, the host's arm and its undeflected camber force - is worked out once (PrepFlow), the deflection's part
+		// per call (EvalFlowAt). Same expressions in the same order as EvalFlow, so the results are bit-identical.
+		internal struct FlowPrep
+		{
+			public bool zero;
+			public Vector3 v;
+			public float sqr;
+			public float num;
+			public Vector3 vhat;
+			public float hq;
+			public Vector3 hostArm;
+			public Vector3 hostBase;
+			public bool hostBaseOk;
+		}
+
+		public void PrepFlow(Vector3 vFlow, float rho, ref EvalContext ctx, out FlowPrep p)
+		{
+			p = default(FlowPrep);
+			float sqrMagnitude = vFlow.sqrMagnitude;
+			if (sqrMagnitude < 1f)
+			{
+				p.zero = true;
+				return;
+			}
+			if (kind == SurfaceKind.Stabilator)
+			{
+				vFlow = Downwash.Apply(vFlow, Quaternion.Inverse(ctx.rootInv), vFlow);
+			}
+			p.v = vFlow;
+			p.sqr = sqrMagnitude;
+			p.num = 0.5f * rho * sqrMagnitude * Acc.AP_wingArea(part) * Acc.AP_wingEff(part);
+			p.vhat = vFlow / Mathf.Sqrt(sqrMagnitude);
+			if (hostK > 0f)
+			{
+				p.hq = 0.5f * rho * sqrMagnitude * Acc.AP_wingArea(host) * Acc.AP_wingEff(host);
+				p.hostArm = hostCom + hostRot * hostCol - ctx.cg;
+			}
+		}
+
+		public Vector3 EvalFlowAt(float delta, ref FlowPrep p, ref EvalContext ctx)
+		{
+			if (p.zero)
+			{
+				return Vector3.zero;
+			}
+			Vector3 vFlow = p.v;
+			Quaternion quaternion = visRot * Quaternion.AngleAxis(delta - deltaVis, Vector3.right) * lRel;
+			Vector3 vector = Quaternion.Inverse(quaternion) * vFlow;
+			foil.Get(Mathf.Atan2(vector.y, vector.z), out var CL, out var CD);
+			Vector3 rhs = quaternion * Vector3.right;
+			Vector3 vector2 = Vector3.Cross(vFlow, rhs);
+			float magnitude = vector2.magnitude;
+			if (magnitude < 0.0001f)
+			{
+				return Vector3.zero;
+			}
+			float num = p.num;
+			Vector3 rhs2 = -vector2 / magnitude * (CL * num) - p.vhat * (CD * num);
+			Vector3 mF = Vector3.Cross(com + quaternion * col - ctx.cg, rhs2);
+			if (hostK > 0f)
+			{
+				Vector3 dH = Vector3.zero;
+				if (!(hostK <= 0f) && !(Mathf.Abs(delta) < 0.01f))
+				{
+					if (!p.hostBaseOk)
+					{
+						p.hostBase = Camber.Foil(vFlow, hostRot, hostFoil, p.hq);
+						p.hostBaseOk = true;
+					}
+					dH = Camber.DeltaFrom(p.hostBase, vFlow, hostRot, hingeAxis, hostK, delta, hostFoil, p.hq);
+				}
+				mF += Vector3.Cross(p.hostArm, dH);
 			}
 			return Effector.ToAero(ctx.rootInv, mF);
 		}

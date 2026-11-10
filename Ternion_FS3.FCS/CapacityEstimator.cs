@@ -352,5 +352,20 @@ namespace Ternion_FS3.FCS
 			w.Write(string.Format(ci, ",{0:F1},{1:F1},{2:F1},{3:F1},{4:F1},{5:F1},{6:F1},{7:F1}", capZP, capZN, capXP, capXN, capSP, capSN, capBP, capBN));
 			w.Write(string.Format(ci, ",{0:F1},{1:F1},{2:F2},{3:F2},{4:F1},{5:F1},{6:F1},{7:F1},{8:F1},{9:F1},{10:F1},{11},{12}", capZeP, capZeN, rudWDbg, rudWFadeDbg, yawPureP, yawPureN, capTrZeP, capTrZeN, capZeNsP, capZeNsN, wdZNs, gUpdZ, gUpdX));
 		}
+
+		// F-22E 3.0.4 port: the same columns as Row, boxed into a telemetry row (formatted on the writer thread)
+		internal void RowTo(TelemetryRow r)
+		{
+			r.Add(",{0:F1},{1:F1},{2:F1},{3:F1},{4:F1}", wdZ, wdX, wdB, unX, unZ);
+			float[][] blocks = { cmZ, cmX, disc, prZP, prZN, prXP, prXN, prSP, prSN, prBP, prBN };
+			for (int b = 0; b < blocks.Length; b++)
+			{
+				float[] a = blocks[b];
+				for (int g = 0; g < NG; g++) r.Add((b == 2) ? ",{0:F2}" : ",{0:F1}", a[g]);
+			}
+			r.Add(",{0:F1},{1:F1},{2:F1},{3:F1},{4:F3},{5:F3}", prZPx, prZNx, prXPz, prXNz, gZ, gX);
+			r.Add(",{0:F1},{1:F1},{2:F1},{3:F1},{4:F1},{5:F1},{6:F1},{7:F1}", capZP, capZN, capXP, capXN, capSP, capSN, capBP, capBN);
+			r.Add(",{0:F1},{1:F1},{2:F2},{3:F2},{4:F1},{5:F1},{6:F1},{7:F1},{8:F1},{9:F1},{10:F1},{11},{12}", capZeP, capZeN, rudWDbg, rudWFadeDbg, yawPureP, yawPureN, capTrZeP, capTrZeN, capZeNsP, capZeNsN, wdZNs, gUpdZ, gUpdX);
+		}
 	}
 }

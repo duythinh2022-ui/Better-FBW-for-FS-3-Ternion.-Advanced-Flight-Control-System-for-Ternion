@@ -1,6 +1,8 @@
 #!/bin/bash
-# usage: build.sh <srcdir> <out.dll> [DEFINES]
-M="/home/claude/game/Nuclear Option/NuclearOption_Data/Managed"; B="/home/claude/game/Nuclear Option/BepInEx/core"
+# usage: NO_GAME_DIR="/path/to/Nuclear Option" ./build.sh <srcdir> <out.dll> [DEFINES]
+# NO_GAME_DIR must contain NuclearOption_Data/Managed and BepInEx/core (BepInEx 5).
+: "${NO_GAME_DIR:?set NO_GAME_DIR to your Nuclear Option install folder}"
+M="$NO_GAME_DIR/NuclearOption_Data/Managed"; B="$NO_GAME_DIR/BepInEx/core"
 SRC="$1"; OUT="$2"; DEF="$3"
 CSC=$(ls /usr/lib/dotnet/sdk/*/Roslyn/bincore/csc.dll | head -1)
 dotnet "$CSC" -nologo -noconfig -nostdlib+ -target:library -langversion:9.0 -unsafe+ -optimize+ -deterministic -nowarn:CS0436,CS1701,CS1702 $DEF \

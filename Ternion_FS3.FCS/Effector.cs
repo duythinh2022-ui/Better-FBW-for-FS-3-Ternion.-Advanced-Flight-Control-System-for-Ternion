@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 
 namespace Ternion_FS3.FCS
@@ -169,6 +170,92 @@ namespace Ternion_FS3.FCS
 			}
 			int num2 = (int)num;
 			return FN[num2] + (FN[num2 + 1] - FN[num2]) * (num - (float)num2);
+		}
+
+		// F-22E 3.0.4 (EstimatorJob): the worker's copy of this effector. Same concrete type (the allocator and the estimator test
+		// 'is TvcEffector' / 'is SurfaceEffector' and read SurfaceEffector.kind, readonly and carried by the clone), its own tables.
+		internal Effector ProbeClone()
+		{
+			Effector c = (Effector)MemberwiseClone();
+			c.grid = null;
+			c.M = null;
+			c.FN = null;
+			c.partner = null;
+			return c;
+		}
+
+		// every Effector field by value (the tables copied into the clone's own arrays); partner is re-pointed by the caller
+		internal void ProbeSyncFrom(Effector s)
+		{
+			name = s.name;
+			active = s.active;
+			min = s.min;
+			max = s.max;
+			now = s.now;
+			cmd = s.cmd;
+			cmdOut = s.cmdOut;
+			cmdLag = s.cmdLag;
+			outTraj = s.outTraj;
+			rate = s.rate;
+			reachTau = s.reachTau;
+			twoHorizon = s.twoHorizon;
+			mu = s.mu;
+			lam = s.lam;
+			lo = s.lo;
+			hi = s.hi;
+			pairSign = s.pairSign;
+			symCost = s.symCost;
+			symTarget = s.symTarget;
+			regNorm = s.regNorm;
+			antiCost = s.antiCost;
+			anchor = s.anchor;
+			band = s.band;
+			anchorK = s.anchorK;
+			N = s.N;
+			if (s.grid == null)
+			{
+				grid = null;
+			}
+			else
+			{
+				if (grid == null || grid.Length != s.grid.Length)
+				{
+					grid = new float[s.grid.Length];
+				}
+				Array.Copy(s.grid, grid, s.grid.Length);
+			}
+			if (s.M == null)
+			{
+				M = null;
+			}
+			else
+			{
+				if (M == null || M.Length != s.M.Length)
+				{
+					M = new Vector3[s.M.Length];
+				}
+				Array.Copy(s.M, M, s.M.Length);
+			}
+			if (s.FN == null)
+			{
+				FN = null;
+			}
+			else
+			{
+				if (FN == null || FN.Length != s.FN.Length)
+				{
+					FN = new float[s.FN.Length];
+				}
+				Array.Copy(s.FN, FN, s.FN.Length);
+			}
+			lastFN = s.lastFN;
+			Mnow = s.Mnow;
+			rollGroup = s.rollGroup;
+			pitchGroup = s.pitchGroup;
+			nodeOn = s.nodeOn;
+			nodeK = s.nodeK;
+			nodeC = s.nodeC;
+			nodeD = s.nodeD;
 		}
 
 		public abstract void Evaluate(ref EvalContext ctx);

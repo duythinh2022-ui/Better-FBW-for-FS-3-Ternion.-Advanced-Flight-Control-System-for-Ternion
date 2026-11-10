@@ -164,6 +164,13 @@ namespace Ternion_FS3.FCS
 				Registry.Disengage(aircraft);
 				return true;
 			}
+			// 3.1.0: after the pilot ejects, the jet goes back to the stock fly-by-wire. Before, Player == null made the empty jet look
+			// like an AI jet, and with AIFlightControl on the FCS kept flying it (reported on Discord, 5 Nov).
+			if (aircraft.HasEjected())
+			{
+				Registry.Disengage(aircraft);
+				return true;
+			}
 			bool flag = (UnityEngine.Object)(object)aircraft.Player == null;
 			Registry.NoteHook(aircraft, flag);
 			if (!aircraft.LocalSim || (flag && !Plugin.AIFlightControl))
@@ -193,8 +200,11 @@ namespace Ternion_FS3.FCS
 					inputs.roll *= fade;
 				}
 				orCreate.stockCf = __instance;
+				long tickT0 = TickStats.Start();   // 3.0.4 tick timer
 				orCreate.Tick(inputs, flag || flightAssist);
+				long vmcT0 = TickStats.Start();   // 3.1.1: VmcApply on its own
 				orCreate.VmcApply(inputs, Time.fixedDeltaTime);
+				TickStats.Stop(orCreate, tickT0, TickStats.Start() - vmcT0);
 				return false;
 			}
 			catch (Exception e)

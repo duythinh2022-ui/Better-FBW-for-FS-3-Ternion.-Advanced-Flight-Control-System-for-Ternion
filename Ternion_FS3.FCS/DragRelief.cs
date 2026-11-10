@@ -188,7 +188,20 @@ namespace Ternion_FS3.FCS
 			Plugin.Log.LogInfo($"Ternion FCS drag relief on {((UnityEngine.Object)(object)a).name}: {r.parts.Count} parts, AoA-dependent drag -{Plugin.DragReliefAoA * 100f:F0}% up to {Plugin.DragReliefFadeStart:F0} deg AoA, -{Plugin.DragReliefAoAHigh * 100f:F0}% from {Plugin.DragReliefFadeEnd:F0} deg, Mach relief {Plugin.DragReliefTransonic * 100f:F0}%, AoA drag bump +{Plugin.AoADragBump * 100f:F0}% at {Plugin.AoADragBumpPeak:F0} deg body AoA ({Plugin.AoADragBumpStart:F0}-{Plugin.AoADragBumpEnd:F0}).");
 		}
 
+		// F-22E 3.1.3: timed for the TickTimerLog line (this force hook runs in the game's FixedUpdate, outside the FCS tick)
 		private void FixedUpdate()
+		{
+			if (!Plugin.TickTimerLog)
+			{
+				FixedUpdateBody();
+				return;
+			}
+			long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+			FixedUpdateBody();
+			HookTimer.Note(0, (UnityEngine.Object)(object)ac != null && (UnityEngine.Object)(object)ac.Player != null, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+		}
+
+		private void FixedUpdateBody()
 		{
 			if ((UnityEngine.Object)(object)ac == null)
 			{

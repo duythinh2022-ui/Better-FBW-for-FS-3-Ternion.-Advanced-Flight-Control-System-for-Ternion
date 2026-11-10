@@ -853,16 +853,8 @@ namespace Ternion_FS3.FCS
 		public float slipAuthDbg = 25f;
 		public float slipStiffDbg;
 
-		// 2.31.2 (telemetry only, drives nothing): the passive airframe, evaluated per part as the game does (AirframeMomentAt).
-		// psA*: the airframe's own roll / yaw acceleration now (surfaces where they are, no thrust; deg/s^2, x roll right, z yaw right)
-		// psD*: how that changes if the body rates go from (p, r) to this tick's (pCmd, rCmd) - the help (or opposition) the
-		//       measured term does not contain yet; cePass*: psD as capacity toward each side, and along the velocity-roll axis
-		// psL* / psN*: roll / yaw derivatives at the present state, per deg of sideslip (b) and per deg/s of p and r (0.1 s cadence)
-		internal static bool PassiveProbeOn = true;
-		internal static float PassiveDerivPeriod = 0.1f;
-		public float psAX, psAZ, psDX, psDZ, psLb, psNb, psLp, psNp, psLr, psNr;
-		public float cePassXP, cePassXN, cePassZP, cePassZN, cePassSP, cePassSN;
-		private float psDerivTimer;
+		// 3.1.0: the 2.31.2 passive-airframe telemetry (PassiveStep) is archived (C:\Games\NO mods\F22E-FCS-retired-passive-step). Its CSV
+		// columns (psAX..psNr, cePassXP..cePassSN) are kept and write 0. AirframeMomentAt stays: the bench's sliptruth tool uses it.
 		private List<(ControlSurface cs, AeroPart host, AirfoilTable table)> psCamber;
 		private readonly Dictionary<AeroPart, float> psCdMin = new Dictionary<AeroPart, float>();
 		// 2.5.8 rate mode (RollPaceRateMode): the lever is the commanded roll rate, not the trajectory's acceleration or braking.
@@ -937,6 +929,52 @@ namespace Ternion_FS3.FCS
 		internal static bool PaceRevIntent = true;
 
 		public Vector3 allocUnmet;
+
+		// F-22E 3.1.0: the table rebuild's surfaces for the fork-join (ParallelTables)
+		private readonly List<SurfaceEffector> parSurf = new List<SurfaceEffector>();
+
+		// F-22E 3.1.0 per-phase timer (Stopwatch ticks, this tick): table rebuild, allocator solves (main allocator), estimator kick, CSV capture
+		internal long phRebuild, phAlloc, phKick, phRow;
+
+		// F-22E 3.1.1: the rest split further - laws, the asym step (its moment, slip probe and sweep inside it), the envelope, mass
+		// properties, flaps, ground steering, VmcApply (timed by the hook)
+		internal long phLaws, phAsym, phAsymMom, phSlip, phSweep, phEnv, phMass, phFlaps, phGround, phVmc;
+
+		// F-22E 3.0.4: the estimator's probes on a worker thread (EstimatorJob); kicked where the estimator ran, joined at the top of
+		// the next Tick
+		private EstimatorJob estJobF;
+
+		internal EstimatorJob estJob => estJobF ?? (estJobF = new EstimatorJob(capEst));
+
+		// collect the estimator now (bench: before reading capEst after a Tick)
+		internal void EstJoin()
+		{
+			estJobF?.Join();
+		}
+
+		// F-22E 3.0.4: the CSV row of tick N is captured at the end of tick N and finished at the top of tick N+1, once the estimator
+		// job of tick N is joined (its columns) and tick N's time is known (fcsUs)
+		private TelemetryRow pendingRow;
+
+		// F-22E 3.0.4 tick timer (Hooks: Tick + VmcApply, wall time, us)
+		internal float lastTickUs;
+
+		internal void NoteTickTime(float us, long vmcTicks = 0L)
+		{
+			phVmc = vmcTicks;
+			lastTickUs = us;
+			phAlloc = alloc.solveTicks - allocTicks0;
+		}
+
+		private long allocTicks0;
+
+		internal static float TicksToUs(long t)
+		{
+			return (float)((double)t * 1000000.0 / (double)System.Diagnostics.Stopwatch.Frequency);
+		}
+
+		// the allocator re-solves against the stabs' reach (telemetry): the probes' share is on the worker's allocator when threaded
+		private int ReachMovesTotal => alloc.reachMoves + ((estJobF != null) ? estJobF.WorkerReachMoves : 0);
 
 		private Lpf3 allocUnmetF;
 
@@ -2929,6 +2967,8 @@ namespace Ternion_FS3.FCS
 
 		public FcsController(Aircraft aircraft)
 		{
+			// Ternion 0.1.10: the tail section behind each engine re-homed onto the wing (StructureFix)
+			StructureFix.Rehome(aircraft);
 			ac = aircraft;
 			inputs = aircraft.GetInputs();
 			AircraftParameters aircraftParameters = aircraft.GetAircraftParameters();
@@ -3261,6 +3301,14 @@ namespace Ternion_FS3.FCS
 
 		public void Dispose()
 		{
+			try
+			{
+				estJobF?.Join();
+				FlushPendingRow();
+			}
+			catch (Exception)
+			{
+			}
 			telemetry?.Close();
 			telemetry = null;
 		}
@@ -4105,7 +4153,17 @@ namespace Ternion_FS3.FCS
 			// and a fresh sweep (thrust term out) is started, so a damage at high AoA and low speed gets the fixed cap and
 			// not a stale 12 deg.
 			bool fixedNow = (engOut || engAsym) && EngineOutFixedCap;
-			if (fixedNow && !engFixedPrev && asymValid)
+			// Ternion 0.1.9 (EngineOutZeroMatch): with an engine OUT there is no AoA cap for it at all - above EngineOutAoACap the live
+			// engine is matched to the dead one (zero thrust), so its yaw is gone instead of the AoA (Tom, 9 Nov: "match thrust, in this
+			// case zero"; the jet reaches its full AoA on the airframe alone). The weak-engine case keeps EngineDamagedAoACap.
+			bool zeroMatchOut = engOut && EngineOutZeroMatch && Plugin.EngineOutZeroThrust && Plugin.EngineAbAoAGate;
+			if (fixedNow && !engFixedPrev && asymValid && zeroMatchOut)
+			{
+				// thrust term out from now on: a fresh sweep, the aero-only cap
+				asymK = -1;
+				asymTimer = 1f;
+			}
+			else if (fixedNow && !engFixedPrev && asymValid)
 			{
 				float capF = engOut ? Plugin.EngineOutAoACap : Plugin.EngineDamagedAoACap;
 				asymCapPos = capF;
@@ -4131,8 +4189,12 @@ namespace Ternion_FS3.FCS
 				tKHoldT = Mathf.Max(0f, tKHoldT - dt);
 			}
 			engFixedPrev = fixedNow;
+			long tPh0 = System.Diagnostics.Stopwatch.GetTimestamp();
 			asymMNow = AsymMomentAt(alpha, rho, rootRot, ref ctx);
+			long tPh1 = System.Diagnostics.Stopwatch.GetTimestamp();
+			phAsymMom += tPh1 - tPh0;
 			SlipProbeStep_(dt, rho, rootRot, ref ctx);
+			phSlip += System.Diagnostics.Stopwatch.GetTimestamp() - tPh1;
 			Vector3 vector = asymMF.Step(asymMNow, Mathf.Max(0.05f, Plugin.AsymFFWashout), dt);
 			float num = Mathf.Max(0.01f, Plugin.AsymDeadband);
 			float num2 = Mathf.Clamp01(Mathf.Max(Mathf.Abs(AccRoll(asymMNow)) / num, Mathf.Abs(AccYaw(asymMNow)) / (0.25f * num)) - 1f);
@@ -4146,13 +4208,17 @@ namespace Ternion_FS3.FCS
 			if (asymK < 0 && asymTimer > 0.2f && ias > Plugin.AsymMinIas)
 			{
 				asymTimer = 0f;
+				long tPh2 = System.Diagnostics.Stopwatch.GetTimestamp();
 				AsymSweepPrep(rootRot);
+				phSweep += System.Diagnostics.Stopwatch.GetTimestamp() - tPh2;
 				asymK = 0;
 			}
 			if (asymK >= 0)
 			{
 				int num5 = Mathf.Min(asymAlphas.Length, asymK + AsymPointsPerStep);
+				long tPh3 = System.Diagnostics.Stopwatch.GetTimestamp();
 				AsymSweepPoints(asymK, num5, rho, rootRot, ref ctx);
+				phSweep += System.Diagnostics.Stopwatch.GetTimestamp() - tPh3;
 				asymK = ((num5 < asymAlphas.Length) ? num5 : (-1));
 			}
 			if (asymK < 0 && asymCycleDone)
@@ -4160,7 +4226,7 @@ namespace Ternion_FS3.FCS
 				asymCycleDone = false;
 				asymCapPos = AsymCap.Find(asymAlphas, asymU, asymAlphas.Length, 1, Plugin.AoAPos, Mathf.Min(Plugin.AsymCapFloor, Plugin.AoAPos), AsymCapUMax);
 				asymCapNeg = AsymCap.Find(asymAlphas, asymU, asymAlphas.Length, -1, Plugin.AoANeg, 0f - Mathf.Min(Plugin.AsymCapFloorNeg, 0f - Plugin.AoANeg), AsymCapUMax);
-				if (engOut && EngineOutFixedCap)
+				if (engOut && EngineOutFixedCap && !(EngineOutZeroMatch && Plugin.EngineOutZeroThrust && Plugin.EngineAbAoAGate))
 				{
 					asymCapPos = Mathf.Min(asymCapPos, Plugin.EngineOutAoACap);
 					asymCapNeg = Mathf.Max(asymCapNeg, 0f - Plugin.EngineOutAoACap);
@@ -4759,62 +4825,6 @@ namespace Ternion_FS3.FCS
 			return new Vector3(0f - mb.z, 0f - mb.x, mb.y);
 		}
 
-		// 2.31.2: the passive airframe telemetry (see the psA / psD / cePass fields). Body rates in the aero frame (x roll, z yaw),
-		// world rotation w = rootRot * (-qa.y, qa.z, -qa.x) for aero rates qa = (p, q, r) - the inverse of the omega mapping in Tick.
-		private void PassiveStep(float dt, float rho, Quaternion rootRot)
-		{
-			if (!PassiveProbeOn || isAI || tas < 30f)
-			{
-				return;
-			}
-			Vector3 vAir = vCgAir;
-			Vector3 W(float pa, float qa, float ra)
-			{
-				return rootRot * new Vector3(0f - qa, ra, 0f - pa);
-			}
-			float pNow = omega.x, qNow = omega.y, rNow = omega.z;   // rad/s
-			Vector3 m0 = AirframeMomentAt(vAir, W(pNow, qNow, rNow), rho, rootRot);
-			psAX = AccRoll(m0);
-			psAZ = AccYaw(m0);
-			Vector3 m1 = AirframeMomentAt(vAir, W(pCmd * (MathF.PI / 180f), qNow, rCmd * (MathF.PI / 180f)), rho, rootRot);
-			psDX = AccRoll(m1) - psAX;
-			psDZ = AccYaw(m1) - psAZ;
-			cePassXP = Mathf.Max(0f, psDX);
-			cePassXN = Mathf.Max(0f, 0f - psDX);
-			cePassZP = Mathf.Max(0f, psDZ);
-			cePassZN = Mathf.Max(0f, 0f - psDZ);
-			float ar = alpha * (MathF.PI / 180f);
-			float dS = psDX * Mathf.Cos(ar) + psDZ * Mathf.Sin(ar);   // along the velocity-roll axis (body roll : yaw = cos a : sin a)
-			cePassSP = Mathf.Max(0f, dS);
-			cePassSN = Mathf.Max(0f, 0f - dS);
-			psDerivTimer += dt;
-			if (psDerivTimer < PassiveDerivPeriod)
-			{
-				return;
-			}
-			psDerivTimer = 0f;
-			// sideslip: the CG flow at (alpha, beta +- db), same TAS (the parametrization of SlipMomentAt and the bench), the rates held
-			const float db = 2f, dw = 5f;
-			Vector3 VAt(float bDeg)
-			{
-				float fa = alpha * (MathF.PI / 180f), fb = bDeg * (MathF.PI / 180f);
-				return rootRot * new Vector3(Mathf.Sin(fb), (0f - Mathf.Sin(fa)) * Mathf.Cos(fb), Mathf.Cos(fa) * Mathf.Cos(fb)) * tas;
-			}
-			Vector3 wNow = W(pNow, qNow, rNow);
-			Vector3 mbP = AirframeMomentAt(VAt(beta + db), wNow, rho, rootRot);
-			Vector3 mbN = AirframeMomentAt(VAt(beta - db), wNow, rho, rootRot);
-			psLb = (AccRoll(mbP) - AccRoll(mbN)) / (2f * db);
-			psNb = (AccYaw(mbP) - AccYaw(mbN)) / (2f * db);
-			float dwr = dw * (MathF.PI / 180f);
-			Vector3 mpP = AirframeMomentAt(vAir, W(pNow + dwr, qNow, rNow), rho, rootRot);
-			Vector3 mpN = AirframeMomentAt(vAir, W(pNow - dwr, qNow, rNow), rho, rootRot);
-			psLp = (AccRoll(mpP) - AccRoll(mpN)) / (2f * dw);
-			psNp = (AccYaw(mpP) - AccYaw(mpN)) / (2f * dw);
-			Vector3 mrP = AirframeMomentAt(vAir, W(pNow, qNow, rNow + dwr), rho, rootRot);
-			Vector3 mrN = AirframeMomentAt(vAir, W(pNow, qNow, rNow - dwr), rho, rootRot);
-			psLr = (AccRoll(mrP) - AccRoll(mrN)) / (2f * dw);
-			psNr = (AccYaw(mrP) - AccYaw(mrN)) / (2f * dw);
-		}
 
 		// the rudders' one-side yaw and the other surfaces' roll authority at a hypothetical flow (deg/s^2)
 		private void SlipAuthorityAt(float aDeg, float bDeg, float rho, Quaternion rootRot, ref EvalContext ctx, out float yawA, out float rollA)
@@ -4832,8 +4842,9 @@ namespace Ternion_FS3.FCS
 				{
 					continue;
 				}
-				Vector3 mMax = se.EvalFlow(se.max, vector, rho, ref ctx);
-				Vector3 mMin = se.EvalFlow(se.min, vector, rho, ref ctx);
+				se.PrepFlow(vector, rho, ref ctx, out SurfaceEffector.FlowPrep fp);   // 3.1.3: = EvalFlow twice in one flow
+				Vector3 mMax = se.EvalFlowAt(se.max, ref fp, ref ctx);
+				Vector3 mMin = se.EvalFlowAt(se.min, ref fp, ref ctx);
 				if (se.kind == SurfaceKind.Rudder)
 				{
 					yawA += 0.5f * Mathf.Abs(mMax.z - mMin.z) * IaInv[2, 2] * 57.29578f * Mathf.Max(0.05f, rudderAuth);
@@ -4999,6 +5010,10 @@ namespace Ternion_FS3.FCS
 			return result;
 		}
 
+		// F-22E 3.1.2 (ParallelSweep): the asymmetric-load sweep. The parts' Unity state (lift-normal rotation, centre of mass and lift,
+		// areas, foil) is read once per sweep tick on the main thread (swGather) - the same values every point of the tick read before,
+		// since nothing moves the parts inside a tick - and the tick's AoA points are computed in parallel (IndexFork), each writing only
+		// its own index of the sweep arrays, joined before anything reads them. Same expressions in the same order per point.
 		private void AsymSweepPoints(int k0, int k1, float rho, Quaternion rootRot, ref EvalContext ctx)
 		{
 			float[] array = asymDsym;
@@ -5008,195 +5023,316 @@ namespace Ternion_FS3.FCS
 			}
 			float num = Mathf.Max(tas, 1f);
 			Vector3 vector = asymMT;
-			for (int i = k0; i < k1; i++)
+			SwGather(rho);
+			HingeSnaps();
+			int n = k1 - k0;
+			if (Plugin.ParallelSweep && n > 1)
 			{
-				float f = asymAlphas[i] * (MathF.PI / 180f);
-				Vector3 vector2 = rootRot * new Vector3(0f, (0f - Mathf.Sin(f)) * num, Mathf.Cos(f) * num);
-				Vector3 vector3 = vector2 / num;
-				float num2 = 0.5f * rho * num * num;
-				Vector3 zero = Vector3.zero;
-				foreach (AeroPart aeroPart in aeroParts)
+				if (swWork == null)
 				{
-					if (aeroPart == null || aeroPart.rb == null || aeroPart.IsDetached())
-					{
-						continue;
-					}
-					Transform transform = Acc.AP_liftNormal(aeroPart);
-					if (!(transform == null))
-					{
-						Quaternion rotation = AirframeRot(aeroPart, transform);
-						Vector3 lhs = aeroPart.rb.worldCenterOfMass + rotation * Acc.AP_centerOfLift(aeroPart) - cg;
-						Vector3 rhs = -vector3 * (0.5f * num2 * Acc.AP_dragArea(aeroPart));
-						if (!surfaceParts.Contains(aeroPart) && foils.TryGetValue(aeroPart, out var value) && Acc.AP_wingArea(aeroPart) > 0f)
-						{
-							rhs += PartForce(vector2, rotation, rotation * Vector3.right, value, 0.5f * rho * Acc.AP_wingArea(aeroPart) * Acc.AP_wingEff(aeroPart));
-						}
-						zero += Vector3.Cross(lhs, rhs);
-					}
+					swWork = new SweepWork(this);
 				}
-				Vector3 vector4 = Quaternion.Inverse(rootRot) * zero;
-				Vector3 m = new Vector3(0f - vector4.z, 0f - vector4.x, vector4.y) + vector;
-				float pAero = m.y - vector.y;
-				float pStabMin = 0f;
-				float pStabMax = 0f;
-				float pFlapNow = 0f;
-				float pRud0 = 0f;
-				float pRudP = 0f;
-				float pRudM = 0f;
-				float toe = 0f;
-				float num3 = 0f;
-				float num4 = 0f;
-				float t = Mathf.InverseLerp(30f, 45f, Mathf.Abs(asymAlphas[i]));
-				float num5 = RudderAuthAt(asymAlphas[i]);
-				// Revoker 0.2.0: the inboard elevon pair at its symmetric deflection (the roll it makes for the pilot is no load)
-				float pHingeAuth = 0f;
-				foreach (HingeFlapEffector hA in hinges)
+				swWork.Set(k0, rho, rootRot, ctx, array, num, vector);
+				IndexFork.Finish(IndexFork.Start(swWork, n));
+			}
+			else
+			{
+				for (int i = k0; i < k1; i++)
 				{
-					if (hA.active)
-					{
-						Vector3 mH = hA.EvalFlow(hA.SymNow, vector2, rho, ref ctx);
-						m += mH;
-						// Revoker 0.2.5: and its nose-down travel for the authority cap (ElevonAuthShare of it)
-						float pLoH = mH.y;
-						for (int lH = 0; lH < hA.N; lH++)
-						{
-							pLoH = Mathf.Min(pLoH, hA.EvalFlow(hA.grid[lH], vector2, rho, ref ctx).y);
-						}
-						pHingeAuth += Mathf.Lerp(mH.y, pLoH, Plugin.ElevonPitch ? ElevonAuthShare : 0f);
-					}
+					AsymSweepPoint(i, rho, rootRot, ref ctx, array, num, vector);
 				}
-				for (int j = 0; j < surfaces.Count; j++)
-				{
-					SurfaceEffector surfaceEffector = surfaces[j];
-					if (!surfaceEffector.active)
-					{
-						continue;
-					}
-					m += surfaceEffector.EvalFlow(array[j], vector2, rho, ref ctx);
-					if (surfaceEffector.kind == SurfaceKind.Flaperon || surfaceEffector.kind == SurfaceKind.Aileron)
-					{
-						float pRef = surfaceEffector.EvalFlow((flapSymRef != null && j < flapSymRef.Length) ? flapSymRef[j] : 0f, vector2, rho, ref ctx).y;
-						// Revoker 0.2.5 (ElevonAuthShare): the delta's elevons are pitch effectors (ElevonPitch), so their nose-down
-						// travel counts toward the authority the low-thrust / no-TVC cap judges by, at ElevonAuthShare of it (the
-						// rest stays for roll at the cap); the F-22E counted its flaperons only at their present trim
-						if (surfaceEffector.kind == SurfaceKind.Aileron && Plugin.ElevonPitch && ElevonAuthShare > 0f)
-						{
-							float pLo = pRef;
-							for (int lE = 0; lE < surfaceEffector.N; lE++)
-							{
-								pLo = Mathf.Min(pLo, surfaceEffector.EvalFlow(surfaceEffector.grid[lE], vector2, rho, ref ctx).y);
-							}
-							pRef = Mathf.Lerp(pRef, pLo, ElevonAuthShare);
-						}
-						pFlapNow += pRef;
-					}
-					if (surfaceEffector.kind == SurfaceKind.Rudder && toe > 0f)
-					{
-						pRud0 += surfaceEffector.EvalFlow(0f, vector2, rho, ref ctx).y;
-						pRudP += surfaceEffector.EvalFlow(toe, vector2, rho, ref ctx).y;
-						pRudM += surfaceEffector.EvalFlow(0f - toe, vector2, rho, ref ctx).y;
-					}
-					float num6;
-					float num7;
-					switch (surfaceEffector.kind)
-					{
-					case SurfaceKind.Flaperon:
-					case SurfaceKind.Aileron:
-						num6 = 1f;
-						num7 = 1f;
-						break;
-					case SurfaceKind.Stabilator:
-						num6 = (num7 = Mathf.Lerp(Plugin.StabRollShare, 1f, t));
-						break;
-					case SurfaceKind.Rudder:
-						num6 = 0f;
-						num7 = num5;
-						break;
-					default:
-						num6 = (num7 = 0f);
-						break;
-					}
-					if (num6 != 0f || num7 != 0f)
-					{
-						float num8 = float.MaxValue;
-						float num9 = float.MinValue;
-						float num10 = float.MaxValue;
-						float num11 = float.MinValue;
-						float pMinS = float.MaxValue;
-						float pMaxS = float.MinValue;
-						for (int l = 0; l < surfaceEffector.N; l++)
-						{
-							// Revoker 0.2.7: the asymmetric-load cap judges the canards on their stock 40 deg; the 5 deg added in 0.2.7
-							// stay a reserve it does not spend. Counted, they raised the cap with a canard shot off from 30-47 to 49-64
-							// deg (bench, canard_L + wingtip_R + aileron_R + flap_L gone, 350 km/h reversal), where the stop-side roll
-							// authority was down to 11-13 deg/s^2 (0.2.6: 33-65) and the roll error doubled.
-							// Sampled on the stock grid too (31 points over +-40), not the +-45 grid with points over 40 skipped: the cap is
-							// sensitive to where the sweep samples, and the coarser grid alone raised it 25-38 -> 51-53 deg in the full
-							// pull at 290-300 km/h with that damage.
-							float gS = (surfaceEffector.kind == SurfaceKind.Stabilator && AsymStabTravel > 0f && surfaceEffector.N > 1) ? Mathf.Lerp(0f - AsymStabTravel, AsymStabTravel, (float)l / (float)(surfaceEffector.N - 1)) : surfaceEffector.grid[l];
-							Vector3 m2 = surfaceEffector.EvalFlow(gS, vector2, rho, ref ctx);
-							pMinS = Mathf.Min(pMinS, m2.y);
-							pMaxS = Mathf.Max(pMaxS, m2.y);
-							float b = AccRoll(m2);
-							float b2 = AccYaw(m2);
-							num8 = Mathf.Min(num8, b);
-							num9 = Mathf.Max(num9, b);
-							num10 = Mathf.Min(num10, b2);
-							num11 = Mathf.Max(num11, b2);
-						}
-						num3 += num6 * 0.5f * (num9 - num8);
-						num4 += num7 * 0.5f * (num11 - num10);
-						if (surfaceEffector.kind == SurfaceKind.Stabilator)
-						{
-							pStabMin += pMinS;
-							pStabMax += pMaxS;
-						}
-					}
-				}
-				asymNetDn[i] = (pAero + pStabMin) * IaInv[1, 1] * 57.29578f;
-				asymAirP[i] = pAero * IaInv[1, 1] * 57.29578f;
-				asymStabLo[i] = pStabMin * IaInv[1, 1] * 57.29578f;
-				asymStabHi[i] = pStabMax * IaInv[1, 1] * 57.29578f;
-				// 2.0.9: the symmetric rudder toe (2.0.7 pitch aid, up to RudderToeMax each way) counts toward the nose-down
-				// authority the low-thrust cap judges by (the rudders' pitch was left out before, neutral or toed)
-				float pRud = (toe > 0f) ? Mathf.Min(pRud0, Mathf.Min(pRudP, pRudM)) : 0f;
-				authNetDn[i] = (pAero + pStabMin + pFlapNow + pRud + pHingeAuth) * IaInv[1, 1] * 57.29578f;
-				asymNetUp[i] = (pAero + pStabMax) * IaInv[1, 1] * 57.29578f;
-				asymAr[i] = AccRoll(m);
-				asymAy[i] = AccYaw(m);
-				asymCr[i] = num3;
-				asymCy[i] = num4;
-				// 1.8.45: the demand is judged at the dynamic pressure predicted from a rapid IAS decay. Load and authority
-				// both scale with q and the absolute reserves (AsymRollReserveAccel / AsymYawReserveAccel) do not, so where
-				// those bind, and through the fixed deadband everywhere, a fast deceleration brings the cap down ahead of
-				// the authority loss. The share of the authority the reserve may claim is AsymResMaxFrac (0.8, as before).
-				float kq = qPredK;
-				float crK = kq * num3;
-				float cyK = kq * num4;
-				float num12 = Mathf.Clamp01(Plugin.AsymReserve);
-				float tauRes = (Plugin.AsymRollTau > 0.01f) ? (Mathf.Max(0f, pStockRef) / Plugin.AsymRollTau) : 0f;
-				float num13 = Mathf.Min(Mathf.Max(num12 * crK, Mathf.Max(tauRes, Plugin.AsymRollReserveAccel)), AsymResMaxFrac * crK);
-				float num14 = Mathf.Min(Mathf.Max(num12 * cyK, Plugin.AsymYawReserveAccel), AsymResMaxFrac * cyK);
-				float num15 = Mathf.Max(0f, Plugin.AsymDeadband);
-				float num16 = 0.25f * num15;
-				// 2.0.12: the thrust part of the load (one engine out: tvc.Mnow) does not fall with q the way the aero load
-				// and the authority do, so only the aero part is scaled by the predicted q. 2.0.11 scaled both: the engine-out
-				// cap was judged at today's IAS however fast the pull was bleeding it (10:37 log: AoA 64.7 deg at 101 m/s before
-				// the cap came down, 3 s after the pull).
-				float arT = AsymThrustSplit ? AccRoll(vector) : 0f;
-				float ayT = AsymThrustSplit ? AccYaw(vector) : 0f;
-				// 2.0.13: with an engine out the thrust part is left out of the cap altogether (the cap is the fixed
-				// EngineOutAoACap plus whatever an aerodynamic asymmetry needs): the thrust yaw is the throttle's business
-				// (VMC protection), and judging it here made the cap follow speed and throttle, 12 <-> 65 deg in seconds
-				float tK = (((engOut || engAsym) && EngineOutFixedCap) || tKHoldT > 0f) ? 0f : 1f;
-				float arL = kq * (asymAr[i] - arT) + tK * arT;
-				float ayL = kq * (asymAy[i] - ayT) + tK * ayT;
-				asymU[i] = Mathf.Max(0f, Mathf.Abs(arL) - num15) / Mathf.Max(crK - num13, 1f) + Mathf.Max(0f, Mathf.Abs(ayL) - num16) / Mathf.Max(cyK - num14, 1f);
 			}
 			if (k1 >= asymAlphas.Length)
 			{
 				asymCycleDone = true;
 			}
+		}
+
+		private sealed class SweepWork : IIndexWork
+		{
+			private readonly FcsController c;
+			private int k0;
+			private float rho, num;
+			private Quaternion rootRot;
+			private EvalContext ctx;
+			private float[] array;
+			private Vector3 vector;
+
+			public SweepWork(FcsController c)
+			{
+				this.c = c;
+			}
+
+			public void Set(int k0, float rho, Quaternion rootRot, EvalContext ctx, float[] array, float num, Vector3 vector)
+			{
+				this.k0 = k0;
+				this.rho = rho;
+				this.rootRot = rootRot;
+				this.ctx = ctx;
+				this.array = array;
+				this.num = num;
+				this.vector = vector;
+			}
+
+			public void Do(int i)
+			{
+				EvalContext c2 = ctx;
+				c.AsymSweepPoint(k0 + i, rho, rootRot, ref c2, array, num, vector);
+			}
+		}
+
+		private SweepWork swWork;
+
+		private int swN;
+		private Quaternion[] swRot = new Quaternion[0];
+		private Vector3[] swLhs = new Vector3[0];
+		private float[] swDrag = new float[0];
+		private AirfoilTable[] swFoil = new AirfoilTable[0];
+		private float[] swQ = new float[0];
+
+		// the hinged flaps' game-side state for the sweep's workers (HingeFlapEffector.Snap) and their symmetric deflection (SymNow)
+		private HingeFlapEffector.FlowSnap[] hSnap = new HingeFlapEffector.FlowSnap[0];
+		private float[] hSym = new float[0];
+
+		private void HingeSnaps()
+		{
+			int nh = hinges.Count;
+			if (hSnap.Length < nh)
+			{
+				hSnap = new HingeFlapEffector.FlowSnap[nh];
+				hSym = new float[nh];
+			}
+			for (int hi = 0; hi < nh; hi++)
+			{
+				HingeFlapEffector hA = hinges[hi];
+				if (hA.active)
+				{
+					hA.Snap(out hSnap[hi]);
+					hSym[hi] = hA.SymNow;
+				}
+			}
+		}
+
+		// the parts' state for the sweep (main thread): rotation, arm, drag area, foil and dynamic-pressure factor
+		private void SwGather(float rho)
+		{
+			int cap = aeroParts.Count;
+			if (swRot.Length < cap)
+			{
+				swRot = new Quaternion[cap];
+				swLhs = new Vector3[cap];
+				swDrag = new float[cap];
+				swFoil = new AirfoilTable[cap];
+				swQ = new float[cap];
+			}
+			swN = 0;
+			foreach (AeroPart aeroPart in aeroParts)
+			{
+				if (aeroPart == null || aeroPart.rb == null || aeroPart.IsDetached())
+				{
+					continue;
+				}
+				Transform transform = Acc.AP_liftNormal(aeroPart);
+				if (!(transform == null))
+				{
+					Quaternion rotation = AirframeRot(aeroPart, transform);
+					int k = swN++;
+					swRot[k] = rotation;
+					swLhs[k] = aeroPart.rb.worldCenterOfMass + rotation * Acc.AP_centerOfLift(aeroPart) - cg;
+					swDrag[k] = Acc.AP_dragArea(aeroPart);
+					if (!surfaceParts.Contains(aeroPart) && foils.TryGetValue(aeroPart, out var value) && Acc.AP_wingArea(aeroPart) > 0f)
+					{
+						swFoil[k] = value;
+						swQ[k] = 0.5f * rho * Acc.AP_wingArea(aeroPart) * Acc.AP_wingEff(aeroPart);
+					}
+					else
+					{
+						swFoil[k] = null;
+						swQ[k] = 0f;
+					}
+				}
+			}
+		}
+
+		// one AoA point of the sweep: what the loop body did for point i (writes only index i of the sweep's arrays)
+		private void AsymSweepPoint(int i, float rho, Quaternion rootRot, ref EvalContext ctx, float[] array, float num, Vector3 vector)
+		{
+			float f = asymAlphas[i] * (MathF.PI / 180f);
+			Vector3 vector2 = rootRot * new Vector3(0f, (0f - Mathf.Sin(f)) * num, Mathf.Cos(f) * num);
+			Vector3 vector3 = vector2 / num;
+			float num2 = 0.5f * rho * num * num;
+			Vector3 zero = Vector3.zero;
+			// perf port: the parts' state from SwGather (read once per sweep tick on the main thread), same expressions, same order
+			for (int k = 0; k < swN; k++)
+			{
+				Vector3 rhs = -vector3 * (0.5f * num2 * swDrag[k]);
+				if (swFoil[k] != null)
+				{
+					rhs += PartForce(vector2, swRot[k], swRot[k] * Vector3.right, swFoil[k], swQ[k]);
+				}
+				zero += Vector3.Cross(swLhs[k], rhs);
+			}
+			Vector3 vector4 = Quaternion.Inverse(rootRot) * zero;
+			Vector3 m = new Vector3(0f - vector4.z, 0f - vector4.x, vector4.y) + vector;
+			float pAero = m.y - vector.y;
+			float pStabMin = 0f;
+			float pStabMax = 0f;
+			float pFlapNow = 0f;
+			float pRud0 = 0f;
+			float pRudP = 0f;
+			float pRudM = 0f;
+			float toe = 0f;
+			float num3 = 0f;
+			float num4 = 0f;
+			float t = Mathf.InverseLerp(30f, 45f, Mathf.Abs(asymAlphas[i]));
+			float num5 = RudderAuthAt(asymAlphas[i]);
+			// Revoker 0.2.0: the inboard elevon pair at its symmetric deflection (the roll it makes for the pilot is no load)
+			float pHingeAuth = 0f;
+			for (int hi = 0; hi < hinges.Count; hi++)
+			{
+				HingeFlapEffector hA = hinges[hi];   // perf port: on the hinge snapshot (HingeSnaps, main thread)
+				if (hA.active)
+				{
+					Vector3 mH = hA.EvalFlowSnap(hSym[hi], vector2, rho, ref ctx, ref hSnap[hi]);
+					m += mH;
+					// Revoker 0.2.5: and its nose-down travel for the authority cap (ElevonAuthShare of it)
+					float pLoH = mH.y;
+					for (int lH = 0; lH < hA.N; lH++)
+					{
+						pLoH = Mathf.Min(pLoH, hA.EvalFlowSnap(hA.grid[lH], vector2, rho, ref ctx, ref hSnap[hi]).y);
+					}
+					pHingeAuth += Mathf.Lerp(mH.y, pLoH, Plugin.ElevonPitch ? ElevonAuthShare : 0f);
+				}
+			}
+			for (int j = 0; j < surfaces.Count; j++)
+			{
+				SurfaceEffector surfaceEffector = surfaces[j];
+				if (!surfaceEffector.active)
+				{
+					continue;
+				}
+				// perf port: the flow's own terms once per surface and point (PrepFlow), each deflection's after (EvalFlowAt); = EvalFlow
+				surfaceEffector.PrepFlow(vector2, rho, ref ctx, out SurfaceEffector.FlowPrep fp);
+				m += surfaceEffector.EvalFlowAt(array[j], ref fp, ref ctx);
+				if (surfaceEffector.kind == SurfaceKind.Flaperon || surfaceEffector.kind == SurfaceKind.Aileron)
+				{
+					float pRef = surfaceEffector.EvalFlowAt((flapSymRef != null && j < flapSymRef.Length) ? flapSymRef[j] : 0f, ref fp, ref ctx).y;
+					// Revoker 0.2.5 (ElevonAuthShare): the delta's elevons are pitch effectors (ElevonPitch), so their nose-down
+					// travel counts toward the authority the low-thrust / no-TVC cap judges by, at ElevonAuthShare of it (the
+					// rest stays for roll at the cap); the F-22E counted its flaperons only at their present trim
+					if (surfaceEffector.kind == SurfaceKind.Aileron && Plugin.ElevonPitch && ElevonAuthShare > 0f)
+					{
+						float pLo = pRef;
+						for (int lE = 0; lE < surfaceEffector.N; lE++)
+						{
+							pLo = Mathf.Min(pLo, surfaceEffector.EvalFlowAt(surfaceEffector.grid[lE], ref fp, ref ctx).y);
+						}
+						pRef = Mathf.Lerp(pRef, pLo, ElevonAuthShare);
+					}
+					pFlapNow += pRef;
+				}
+				if (surfaceEffector.kind == SurfaceKind.Rudder && toe > 0f)
+				{
+					pRud0 += surfaceEffector.EvalFlowAt(0f, ref fp, ref ctx).y;
+					pRudP += surfaceEffector.EvalFlowAt(toe, ref fp, ref ctx).y;
+					pRudM += surfaceEffector.EvalFlowAt(0f - toe, ref fp, ref ctx).y;
+				}
+				float num6;
+				float num7;
+				switch (surfaceEffector.kind)
+				{
+				case SurfaceKind.Flaperon:
+				case SurfaceKind.Aileron:
+					num6 = 1f;
+					num7 = 1f;
+					break;
+				case SurfaceKind.Stabilator:
+					num6 = (num7 = Mathf.Lerp(Plugin.StabRollShare, 1f, t));
+					break;
+				case SurfaceKind.Rudder:
+					num6 = 0f;
+					num7 = num5;
+					break;
+				default:
+					num6 = (num7 = 0f);
+					break;
+				}
+				if (num6 != 0f || num7 != 0f)
+				{
+					float num8 = float.MaxValue;
+					float num9 = float.MinValue;
+					float num10 = float.MaxValue;
+					float num11 = float.MinValue;
+					float pMinS = float.MaxValue;
+					float pMaxS = float.MinValue;
+					for (int l = 0; l < surfaceEffector.N; l++)
+					{
+						// Revoker 0.2.7: the asymmetric-load cap judges the canards on their stock 40 deg; the 5 deg added in 0.2.7
+						// stay a reserve it does not spend. Counted, they raised the cap with a canard shot off from 30-47 to 49-64
+						// deg (bench, canard_L + wingtip_R + aileron_R + flap_L gone, 350 km/h reversal), where the stop-side roll
+						// authority was down to 11-13 deg/s^2 (0.2.6: 33-65) and the roll error doubled.
+						// Sampled on the stock grid too (31 points over +-40), not the +-45 grid with points over 40 skipped: the cap is
+						// sensitive to where the sweep samples, and the coarser grid alone raised it 25-38 -> 51-53 deg in the full
+						// pull at 290-300 km/h with that damage.
+						float gS = (surfaceEffector.kind == SurfaceKind.Stabilator && AsymStabTravel > 0f && surfaceEffector.N > 1) ? Mathf.Lerp(0f - AsymStabTravel, AsymStabTravel, (float)l / (float)(surfaceEffector.N - 1)) : surfaceEffector.grid[l];
+						Vector3 m2 = surfaceEffector.EvalFlowAt(gS, ref fp, ref ctx);
+						pMinS = Mathf.Min(pMinS, m2.y);
+						pMaxS = Mathf.Max(pMaxS, m2.y);
+						float b = AccRoll(m2);
+						float b2 = AccYaw(m2);
+						num8 = Mathf.Min(num8, b);
+						num9 = Mathf.Max(num9, b);
+						num10 = Mathf.Min(num10, b2);
+						num11 = Mathf.Max(num11, b2);
+					}
+					num3 += num6 * 0.5f * (num9 - num8);
+					num4 += num7 * 0.5f * (num11 - num10);
+					if (surfaceEffector.kind == SurfaceKind.Stabilator)
+					{
+						pStabMin += pMinS;
+						pStabMax += pMaxS;
+					}
+				}
+			}
+			asymNetDn[i] = (pAero + pStabMin) * IaInv[1, 1] * 57.29578f;
+			asymAirP[i] = pAero * IaInv[1, 1] * 57.29578f;
+			asymStabLo[i] = pStabMin * IaInv[1, 1] * 57.29578f;
+			asymStabHi[i] = pStabMax * IaInv[1, 1] * 57.29578f;
+			// 2.0.9: the symmetric rudder toe (2.0.7 pitch aid, up to RudderToeMax each way) counts toward the nose-down
+			// authority the low-thrust cap judges by (the rudders' pitch was left out before, neutral or toed)
+			float pRud = (toe > 0f) ? Mathf.Min(pRud0, Mathf.Min(pRudP, pRudM)) : 0f;
+			authNetDn[i] = (pAero + pStabMin + pFlapNow + pRud + pHingeAuth) * IaInv[1, 1] * 57.29578f;
+			asymNetUp[i] = (pAero + pStabMax) * IaInv[1, 1] * 57.29578f;
+			asymAr[i] = AccRoll(m);
+			asymAy[i] = AccYaw(m);
+			asymCr[i] = num3;
+			asymCy[i] = num4;
+			// 1.8.45: the demand is judged at the dynamic pressure predicted from a rapid IAS decay. Load and authority
+			// both scale with q and the absolute reserves (AsymRollReserveAccel / AsymYawReserveAccel) do not, so where
+			// those bind, and through the fixed deadband everywhere, a fast deceleration brings the cap down ahead of
+			// the authority loss. The share of the authority the reserve may claim is AsymResMaxFrac (0.8, as before).
+			float kq = qPredK;
+			float crK = kq * num3;
+			float cyK = kq * num4;
+			float num12 = Mathf.Clamp01(Plugin.AsymReserve);
+			float tauRes = (Plugin.AsymRollTau > 0.01f) ? (Mathf.Max(0f, pStockRef) / Plugin.AsymRollTau) : 0f;
+			float num13 = Mathf.Min(Mathf.Max(num12 * crK, Mathf.Max(tauRes, Plugin.AsymRollReserveAccel)), AsymResMaxFrac * crK);
+			float num14 = Mathf.Min(Mathf.Max(num12 * cyK, Plugin.AsymYawReserveAccel), AsymResMaxFrac * cyK);
+			float num15 = Mathf.Max(0f, Plugin.AsymDeadband);
+			float num16 = 0.25f * num15;
+			// 2.0.12: the thrust part of the load (one engine out: tvc.Mnow) does not fall with q the way the aero load
+			// and the authority do, so only the aero part is scaled by the predicted q. 2.0.11 scaled both: the engine-out
+			// cap was judged at today's IAS however fast the pull was bleeding it (10:37 log: AoA 64.7 deg at 101 m/s before
+			// the cap came down, 3 s after the pull).
+			float arT = AsymThrustSplit ? AccRoll(vector) : 0f;
+			float ayT = AsymThrustSplit ? AccYaw(vector) : 0f;
+			// 2.0.13: with an engine out the thrust part is left out of the cap altogether (the cap is the fixed
+			// EngineOutAoACap plus whatever an aerodynamic asymmetry needs): the thrust yaw is the throttle's business
+			// (VMC protection), and judging it here made the cap follow speed and throttle, 12 <-> 65 deg in seconds
+			float tK = (((engOut || engAsym) && EngineOutFixedCap) || tKHoldT > 0f) ? 0f : 1f;
+			float arL = kq * (asymAr[i] - arT) + tK * arT;
+			float ayL = kq * (asymAy[i] - ayT) + tK * ayT;
+			asymU[i] = Mathf.Max(0f, Mathf.Abs(arL) - num15) / Mathf.Max(crK - num13, 1f) + Mathf.Max(0f, Mathf.Abs(ayL) - num16) / Mathf.Max(cyK - num14, 1f);
 		}
 
 		private float NonSurfacePitch(Vector3 wind, float rho, Quaternion rootInv, Vector3 rootRight, float dAlphaDeg, float qRad)
@@ -5228,7 +5364,9 @@ namespace Ternion_FS3.FCS
 
 		private Vector3 vCgAir;
 
-		private void ComputeHybridSlopes(Vector3 wind, float rho, Vector3 rootRight)
+		// F-22E 3.1.3 (ParallelEnvelope): the four NonSurfacePitch evaluations of ComputeHybridSlopes on the parts' state read once
+		// (HsGather, main thread); HsPoint(k) = NonSurfacePitch with the k-th arguments, same expressions in the same part order.
+		private void HsGather(Vector3 wind, float rho, Vector3 rootRight)
 		{
 			if (surfaceParts.Count == 0)
 			{
@@ -5240,16 +5378,135 @@ namespace Ternion_FS3.FCS
 					}
 				}
 			}
-			Quaternion rootInv = Quaternion.Inverse(((Component)(object)ac).transform.rotation);
-			vCgAir = ((AirDataAtCg && vCg.sqrMagnitude > 0f) ? vCg : ac.rb.velocity) - wind;
+			hsRootInv = Quaternion.Inverse(((Component)(object)ac).transform.rotation);
+			vCgAir = ((AirDataAtCg && vCg.sqrMagnitude > 0f) ? vCg : ac.rb.velocity) - wind;   // 2.30.0: the CG's, as the model below assumes
 			float q0 = omega.y;
-			float mP = NonSurfacePitch(wind, rho, rootInv, rootRight, 1f, q0);
-			float mM = NonSurfacePitch(wind, rho, rootInv, rootRight, -1f, q0);
-			float mQ1 = NonSurfacePitch(wind, rho, rootInv, rootRight, 0f, q0 + 0.05f);
-			float mQ0 = NonSurfacePitch(wind, rho, rootInv, rootRight, 0f, q0 - 0.05f);
-			mAlphaO = 0.5f * (mP - mM);
-			mQO = (mQ1 - mQ0) / (0.1f * 57.29578f);
+			hsDA[0] = 1f;
+			hsQR[0] = q0;
+			hsDA[1] = -1f;
+			hsQR[1] = q0;
+			hsDA[2] = 0f;
+			hsQR[2] = q0 + 0.05f;
+			hsDA[3] = 0f;
+			hsQR[3] = q0 - 0.05f;
+			hsRootRight = rootRight;
+			int cap = aeroParts.Count;
+			if (hsArm.Length < cap)
+			{
+				hsArm = new Vector3[cap];
+				hsR = new Vector3[cap];
+				hsRot = new Quaternion[cap];
+				hsFoil = new AirfoilTable[cap];
+				hsQS = new float[cap];
+			}
+			hsN = 0;
+			foreach (AeroPart aeroPart in aeroParts)
+			{
+				if (aeroPart == null || aeroPart.rb == null || aeroPart.IsDetached() || surfaceParts.Contains(aeroPart))
+				{
+					continue;
+				}
+				Transform transform = Acc.AP_liftNormal(aeroPart);
+				float area = Acc.AP_wingArea(aeroPart);
+				if (transform == null || area <= 0f || !foils.TryGetValue(aeroPart, out var foil))
+				{
+					continue;
+				}
+				Quaternion rotation = AirframeRot(aeroPart, transform);
+				Vector3 arm = aeroPart.rb.worldCenterOfMass - cg;
+				int k = hsN++;
+				hsRot[k] = rotation;
+				hsArm[k] = arm;
+				hsR[k] = arm + rotation * Acc.AP_centerOfLift(aeroPart);
+				hsFoil[k] = foil;
+				hsQS[k] = 0.5f * rho * area * Acc.AP_wingEff(aeroPart);
+			}
 		}
+
+		private void HsPoint(int c)
+		{
+			Quaternion rot = Quaternion.AngleAxis(hsDA[c], hsRootRight);
+			Vector3 w = -hsRootRight * hsQR[c];
+			Vector3 m = Vector3.zero;
+			for (int k = 0; k < hsN; k++)
+			{
+				Quaternion rotation = hsRot[k];
+				// flow at the part: the CG's air velocity turned by dAlpha, plus the pitch rotation qRad
+				Vector3 v = rot * (vCgAir) + Vector3.Cross(w, hsArm[k]);
+				m += Vector3.Cross(hsR[k], PartForce(v, rotation, rotation * Vector3.right, hsFoil[k], hsQS[k]));
+			}
+			hsOut[c] = 0f - (hsRootInv * m).x;
+		}
+
+		private void HsFinish()
+		{
+			mAlphaO = 0.5f * (hsOut[0] - hsOut[1]);
+			mQO = (hsOut[2] - hsOut[3]) / (0.1f * 57.29578f);
+		}
+
+		private Quaternion hsRootInv;
+		private Vector3 hsRootRight;
+		private readonly float[] hsDA = new float[4];
+		private readonly float[] hsQR = new float[4];
+		private readonly float[] hsOut = new float[4];
+		private int hsN;
+		private Vector3[] hsArm = new Vector3[0];
+		private Vector3[] hsR = new Vector3[0];
+		private Quaternion[] hsRot = new Quaternion[0];
+		private AirfoilTable[] hsFoil = new AirfoilTable[0];
+		private float[] hsQS = new float[0];
+
+		// the envelope's per-part snapshot (ComputeEnvelope) and per-point rotations / downwash
+		private int enN;
+		private Vector3[] enVel = new Vector3[0];
+		private Quaternion[] enRot = new Quaternion[0];
+		private Vector3[] enRight = new Vector3[0];
+		private AirfoilTable[] enFoil = new AirfoilTable[0];
+		private float[] enQS = new float[0];
+		private bool[] enStab = new bool[0];
+		private readonly Quaternion[] enQ = new Quaternion[25];
+		private readonly float[] enEps = new float[25];
+		private Quaternion enRoot;
+		private Vector3 enEL;
+
+		// one envelope point: envLift[j] summed over the parts in the same order as the part-major loop it replaces
+		private void EnvPoint(int j)
+		{
+			Quaternion quaternion2 = enQ[j];
+			for (int p = 0; p < enN; p++)
+			{
+				Vector3 vj = quaternion2 * enVel[p];
+				if (enStab[p])
+				{
+					vj = Downwash.Turn(vj, enRoot, enEps[j]);   // = Downwash.Apply(vj, root, quaternion2 * (v_ac - wind)): eps depends on j only
+				}
+				envLift[j] += PartLift(vj, enRot[p], enRight[p], enFoil[p], enQS[p], enEL);
+			}
+		}
+
+		private sealed class EnvWork : IIndexWork
+		{
+			private readonly FcsController c;
+
+			public EnvWork(FcsController c)
+			{
+				this.c = c;
+			}
+
+			public void Do(int i)
+			{
+				if (i < 25)
+				{
+					c.EnvPoint(i);
+				}
+				else
+				{
+					c.HsPoint(i - 25);
+				}
+			}
+		}
+
+		private EnvWork envWork;
 
 		private void ComputeEnvelope(Vector3 wind, float rho, Vector3 rootRight, Vector3 eL)
 		{
@@ -5264,6 +5521,19 @@ namespace Ternion_FS3.FCS
 			float num3 = mass * 9.81f;
 			Vector3 vCgHat = (((AirDataAtCg && vCg.sqrMagnitude > 0f) ? vCg : ac.rb.velocity) - wind).normalized;
 			float dragAf = 0f;
+			// 3.1.3: the 25 points' per-part inputs are kept (enVel ... enStab) and the points computed after the loop (EnvPoint)
+			int cap = aeroParts.Count;
+			if (enVel.Length < cap)
+			{
+				enVel = new Vector3[cap];
+				enRot = new Quaternion[cap];
+				enRight = new Vector3[cap];
+				enFoil = new AirfoilTable[cap];
+				enQS = new float[cap];
+				enStab = new bool[cap];
+			}
+			enN = 0;
+			bool anyStab = false;
 			foreach (AeroPart aeroPart in aeroParts)
 			{
 				if (aeroPart == null || aeroPart.rb == null)
@@ -5277,6 +5547,7 @@ namespace Ternion_FS3.FCS
 					continue;
 				}
 				Vector3 vector = aeroPart.rb.velocity - wind;
+				Vector3 vRaw = vector;
 				float sqrMagnitude = vector.sqrMagnitude;
 				bool dwPart = Downwash.IsStab(aeroPart);
 				if (dwPart)
@@ -5296,18 +5567,45 @@ namespace Ternion_FS3.FCS
 					float effD = Acc.AP_wingEff(aeroPart);
 					float dArea = Acc.AP_dragArea(aeroPart);
 					dragAf += 0f - Vector3.Dot(PartForce(vector, rotation, right, value, 0.5f * rho * num4 * effD), vCgHat) + 0.25f * rho * sqrMagnitude * (dArea + (dArea + num4 * 0.1f) * (1f - effD));
-					for (int j = 0; j < envAlphas.Length; j++)
-					{
-						Quaternion quaternion2 = Quaternion.AngleAxis((j < 3) ? envAlphas[j] : (envAlphas[j] - alpha), rootRight);
-						Vector3 vj = quaternion2 * (aeroPart.rb.velocity - wind);
-						if (dwPart)
-						{
-							vj = Downwash.Apply(vj, ((Component)(object)ac).transform.rotation, quaternion2 * (ac.rb.velocity - wind));
-						}
-						envLift[j] += PartLift(vj, rotation, right, value, qS, eL);
-					}
+					int p = enN++;
+					enVel[p] = vRaw;
+					enRot[p] = rotation;
+					enRight[p] = right;
+					enFoil[p] = value;
+					enQS[p] = qS;
+					enStab[p] = dwPart;
+					anyStab |= dwPart;
 				}
 			}
+			enRoot = ((Component)(object)ac).transform.rotation;
+			enEL = eL;
+			Vector3 vAc = ac.rb.velocity - wind;
+			for (int j = 0; j < envAlphas.Length; j++)
+			{
+				enQ[j] = Quaternion.AngleAxis((j < 3) ? envAlphas[j] : (envAlphas[j] - alpha), rootRight);
+				enEps[j] = anyStab ? Downwash.EpsFor(enQ[j] * vAc, enRoot) : 0f;
+			}
+			HsGather(wind, rho, rootRight);
+			if (Plugin.ParallelEnvelope)
+			{
+				if (envWork == null)
+				{
+					envWork = new EnvWork(this);
+				}
+				IndexFork.Finish(IndexFork.Start(envWork, envAlphas.Length + 4));
+			}
+			else
+			{
+				for (int j = 0; j < envAlphas.Length; j++)
+				{
+					EnvPoint(j);
+				}
+				for (int c = 0; c < 4; c++)
+				{
+					HsPoint(c);
+				}
+			}
+			HsFinish();
 			// 2.2.16 (AirbrakeAoAFade): the brake's drag (game Airbrake.FixedUpdate: dragAmount x rho x v^2 x opening, on each
 			// carrying part) against the airframe's own. Full open while the brake is AirbrakeFadeShareFull of the total drag or
 			// more, stowed at AirbrakeFadeShareZero or less. Clean jet, bench: share 81 % at 0 deg AoA, 56 % at 10, 42 % at 15,
@@ -5432,6 +5730,15 @@ namespace Ternion_FS3.FCS
 
 		public void Tick(ControlInputs inp, bool flightAssist)
 		{
+			// F-22E 3.0.4: collect last tick's estimator job before anything reads capEst, then finish last tick's CSV row
+			estJobF?.Join();
+			FlushPendingRow();
+			// F-22E 3.1.0: per-phase timer for this tick, and the main allocator's switches
+			phRebuild = phKick = phRow = 0L;
+			phLaws = phAsym = phAsymMom = phSlip = phSweep = phEnv = phMass = phFlaps = phGround = 0L;
+			allocTicks0 = alloc.solveTicks;
+			alloc.timeSolves = true;
+			alloc.parallelReach = Plugin.ParallelAllocator;
 			rawThrottle = (inp != null) ? inp.throttle : 1f;
 			float num = Mathf.Max(0.001f, Time.fixedDeltaTime);
 			time += num;
@@ -5445,12 +5752,14 @@ namespace Ternion_FS3.FCS
 			Quaternion quaternion = Quaternion.Inverse(rotation);
 			massTimer += num;
 			bool flag = massTimer > 0.5f;
+			long tMass0 = System.Diagnostics.Stopwatch.GetTimestamp();
 			if (flag)
 			{
 				massTimer = 0f;
 				RebuildBodies();
 			}
 			UpdateMassProps(flag || !havePrev, quaternion);
+			phMass += System.Diagnostics.Stopwatch.GetTimestamp() - tMass0;
 			Vector3 vector = Acc.AC_wind(ac);
 			Vector3 vRef = (AirDataAtCg && vCg.sqrMagnitude > 0f) ? vCg : rb.velocity;
 			Vector3 vector2 = vRef - vector;
@@ -5503,7 +5812,9 @@ namespace Ternion_FS3.FCS
 					break;
 				}
 			}
+			long tFl0 = System.Diagnostics.Stopwatch.GetTimestamp();
 			flaps.Update(num, this, flag2 && tas < 110f, ac.speed, Mathf.Clamp(inp.roll, -1f, 1f), groundBrake);
+			phFlaps += System.Diagnostics.Stopwatch.GetTimestamp() - tFl0;
 			// Ifrit 0.3.0 (IfritFlaperons): the decelerons (inner) and ailerons (outer) droop on the F-22E flap schedule (AoA,
 			// load and the high-lift speed schedule, stall-capped on each surface's own section flow). Each left/right pair's
 			// common deflection is held at the droop through its pair cost (symCost, as for rudder toe); the differential
@@ -5620,25 +5931,71 @@ namespace Ternion_FS3.FCS
 			}
 			Vector3 zero = Vector3.zero;
 			RollPitchGateStep(num);
-			foreach (Effector eff in effs)
+			long tReb0 = System.Diagnostics.Stopwatch.GetTimestamp();
+			if (Plugin.ParallelTables)
 			{
-				if (eff is SurfaceEffector seH)
+				// F-22E 3.1.0 (ParallelTables): the surfaces' game reads here (EvalGather), their table maths on the pool and this thread
+				// (EvalCompute), the nozzles' Evaluate here meanwhile (it reads the engines' transforms throughout); then the same sum, in
+				// the same order, as below
+				parSurf.Clear();
+				foreach (Effector eff in effs)
 				{
-					seH.honestGate = Mathf.Max(Plugin.OvershootPitchPriority ? pitchNeed : 0f, HonestRollGate * rpLat);
-				}
-				eff.Evaluate(ref ctx);
-				if (eff.active)
-				{
-					zero += eff.Mnow;
-					if (!Engaged || !havePrev)
+					if (eff is SurfaceEffector seH)
 					{
-						eff.cmd = eff.now;
-						eff.cmdOut = eff.now;
-						eff.cmdLag = eff.now;
-						eff.outTraj.Reset(eff.now);
+						seH.honestGate = Mathf.Max(Plugin.OvershootPitchPriority ? pitchNeed : 0f, HonestRollGate * rpLat);
+						if (seH.EvalGather(ref ctx))
+						{
+							parSurf.Add(seH);
+						}
+					}
+				}
+				TableFork.Run tRun = TableFork.Start(parSurf, ctx);
+				foreach (Effector eff in effs)
+				{
+					if (!(eff is SurfaceEffector))
+					{
+						eff.Evaluate(ref ctx);
+					}
+				}
+				TableFork.Finish(tRun);
+				foreach (Effector eff in effs)
+				{
+					if (eff.active)
+					{
+						zero += eff.Mnow;
+						if (!Engaged || !havePrev)
+						{
+							eff.cmd = eff.now;
+							eff.cmdOut = eff.now;
+							eff.cmdLag = eff.now;
+							eff.outTraj.Reset(eff.now);
+						}
 					}
 				}
 			}
+			else
+			{
+				foreach (Effector eff in effs)
+				{
+					if (eff is SurfaceEffector seH)
+					{
+						seH.honestGate = Mathf.Max(Plugin.OvershootPitchPriority ? pitchNeed : 0f, HonestRollGate * rpLat);
+					}
+					eff.Evaluate(ref ctx);
+					if (eff.active)
+					{
+						zero += eff.Mnow;
+						if (!Engaged || !havePrev)
+						{
+							eff.cmd = eff.now;
+							eff.cmdOut = eff.now;
+							eff.cmdLag = eff.now;
+							eff.outTraj.Reset(eff.now);
+						}
+					}
+				}
+			}
+			phRebuild += System.Diagnostics.Stopwatch.GetTimestamp() - tReb0;
 			TeBrakeFadeStep(num);
 			FlapLockStep();
 			TeBrakeLiftBalance();
@@ -5969,6 +6326,24 @@ namespace Ternion_FS3.FCS
 			float fightGate = (fightMode == 1) ? 1f : ((fightMode == 2) ? Mathf.Max(fightPed, (1f - fightRollHold) * relQuiet) : fightPed);
 			fightGateDbg = fightGate;
 			alloc.fightK = ((Engaged && Mode != FcsMode.Ground && Mode != FcsMode.Off) ? (Mathf.Max(0f, Plugin.RollFightCost) * fightGate) : 0f);
+			// Ternion 0.1.9 (FightHintUnpaired): with a roll surface whose mirror partner is gone, the fight cost's reference sign is taken
+			// from the groups' own net roll, not from the target less the surfaces' roll at zero deflection: a lone flaperon's lift at
+			// zero deflection (23-30 deg/s^2 each on this jet) put that reference near the 15 deg/s^2 switch, it flipped every ~2 s and
+			// each flip priced the one wing left as "fighting" the roll (9 Nov 07:50 log, right flaperons + right stab gone, hands
+			// off at 1060 km/h: a roll / yaw kick every 2.0-3.3 s; bench: 13 deg/s^2 of roll left unmet for ~1.1 s of every 2).
+			bool unpairedRoll = false;
+			if (FightHintUnpaired)
+			{
+				foreach (SurfaceEffector sU in surfaces)
+				{
+					if (sU.active && sU.rollGroup != 0 && sU.partner != null && !sU.partner.active)
+					{
+						unpairedRoll = true;
+						break;
+					}
+				}
+			}
+			alloc.fightHintOff = unpairedRoll;
 			// 1.8.42: stab-vs-nozzle pitch fight, while a roll is commanded (and RpRelease after)
 			// not while the pitch-rate command is moving (captures, releases: the nozzles are the fast pitch effector there),
 			// in AoA protection or on an AoA run-away
@@ -6227,10 +6602,13 @@ namespace Ternion_FS3.FCS
 			if (nAlphaTimer > 0.1f)
 			{
 				nAlphaTimer = 0f;
-				ComputeEnvelope(vector, num2, transform.right, vector6);
-				ComputeHybridSlopes(vector, num2, transform.right);
+				long tEnv0 = System.Diagnostics.Stopwatch.GetTimestamp();
+				ComputeEnvelope(vector, num2, transform.right, vector6);   // 3.1.3: with the hybrid slopes (ComputeHybridSlopes) inside
+				phEnv += System.Diagnostics.Stopwatch.GetTimestamp() - tEnv0;
 			}
+			long tAsym0 = System.Diagnostics.Stopwatch.GetTimestamp();
 			AsymStep(num, num2, rotation, ref ctx, vector7, vector8);
+			phAsym += System.Diagnostics.Stopwatch.GetTimestamp() - tAsym0;
 			tw = tvc.totalThrust / (mass * 9.81f);
 			float num15 = 0.5f * num2 * tas * tas;
 			float num16 = 13781.25f;
@@ -6414,7 +6792,9 @@ namespace Ternion_FS3.FCS
 			bool abCmd = Plugin.ThrottleIndependentAirbrake ? (Mathf.Clamp01(inp.brake) > 0.05f) : (rawThrottle <= 0f);
 			airBrake = Mathf.MoveTowards(airBrake, abCmd ? 1f : 0f, 2f * num);
 			gsPedRaw = Mathf.Clamp(inp.yaw, -1f, 1f);
+			long tGs0 = System.Diagnostics.Stopwatch.GetTimestamp();
 			GroundSteer(num, flag4, flag5);
+			phGround += System.Diagnostics.Stopwatch.GetTimestamp() - tGs0;
 			Vector3 vector11;
 			tvc.anchorK = 0f;
 			if (Mode == FcsMode.Ground)
@@ -6540,8 +6920,10 @@ namespace Ternion_FS3.FCS
 			}
 			else
 			{
+				long tLaw0 = System.Diagnostics.Stopwatch.GetTimestamp();
 				PitchLaw(num, vc);
 				LateralLaw(num);
+				phLaws += System.Diagnostics.Stopwatch.GetTimestamp() - tLaw0;
 				if (gsActive && gsMainsContact)
 				{
 					// rolling on the mains with the nose up (rotation / landing flare-out): the ground yaw-rate command replaces
@@ -6613,6 +6995,22 @@ namespace Ternion_FS3.FCS
 				mLeadInit = true;
 				mDotYF = mDotYF + (mDotY - mDotYF) * (num / (MLeadTau + num));
 				vector11 = vector8 + MulI(omegaDotDes - vector7);
+				// Ternion 0.1.9 (SpinRecovery): an uncommanded rotation at post-stall AoA is flown out. See SpinRecStep.
+				SpinRecStep(num);
+				if (spinRecOn)
+				{
+					// roll and yaw rates damped (a fixed acceleration left the roll rate at 40-70 deg/s, and its inertial coupling with the
+					// yaw rate pitched the nose back up from 30 to 90 deg), the nose pushed down while the AoA is past the exit AoA, held there
+					float pD = omega.x * 57.29578f;
+					float qD = omega.y * 57.29578f;
+					float rD = omega.z * 57.29578f;
+					float pitchDes = (Mathf.Abs(alpha) > SpinRecExitAoA) ? ((0f - SpinRecPitchAcc) * Mathf.Sign(alpha)) : Mathf.Clamp(-SpinRecRateK * qD, 0f - SpinRecPitchAcc, SpinRecPitchAcc);
+					Vector3 desR = (SpinRecLaw == 1) ? (new Vector3(Mathf.Clamp(-SpinRecRateK * pD, 0f - SpinRecYawAcc, SpinRecYawAcc), pitchDes, Mathf.Clamp(-SpinRecRateK * rD, 0f - SpinRecYawAcc, SpinRecYawAcc)) * (MathF.PI / 180f)) : (new Vector3((SpinRecLaw == 2) ? Mathf.Clamp(-SpinRecRateK * (pD + SpinRecRollR * rD), 0f - SpinRecYawAcc, SpinRecYawAcc) : 0f, SpinRecPitchDes(qD), (0f - SpinRecYawAcc) * Mathf.Sign(rD)) * (MathF.PI / 180f));
+					vector11 = vector8 + MulI(desR - vector7);
+					// roll last: with a wing's roll surfaces or a stab gone, the remaining elevator's nose-down rolls the jet, and an equal roll
+					// weight held it at -5 of its -30 (bench: AoA crept 22 -> 31 deg in recovery and the spin came back)
+					alloc.axisWeight = new Vector3(alloc.axisWeight.x * SpinRecRollWeight, alloc.axisWeight.y, alloc.axisWeight.z);
+				}
 				vector11.y -= Plugin.HybridIndiGain * hybridDM;
 				vector11.y -= MulI(new Vector3(0f, distLeadAcc, 0f)).y;
 				if (Plugin.ReleasedMomentLead > 0f)
@@ -7288,7 +7686,10 @@ namespace Ternion_FS3.FCS
 				// rudder-fade weight, kept for the telemetry; the estimator's own rudW comes from its probes.
 				// Revoker 0.8.2: what the allocation left unmade of the INDI target (deg/s^2), before the estimator's probes re-solve
 				allocResMain = alloc.Accel(alloc.resDbg);
-				capEst.Step(effs, alloc, vector7, IaInv, zero4, num, unmetRaw, alpha, Mathf.Clamp01(rudderAuth) * Mathf.Clamp01(yawHealth / 0.5f));
+				// F-22E 3.0.4: on a worker thread when EstimatorThreaded (the same Step on copies; collected at the top of the next Tick)
+				long tKick0 = System.Diagnostics.Stopwatch.GetTimestamp();
+				estJob.Kick(Plugin.EstimatorThreaded, effs, alloc, vector7, IaInv, zero4, num, unmetRaw, alpha, Mathf.Clamp01(rudderAuth) * Mathf.Clamp01(yawHealth / 0.5f));
+				phKick += System.Diagnostics.Stopwatch.GetTimestamp() - tKick0;
 				float num36 = 10f;
 				float num37 = 1f;
 				if (tvc.engines.Count > 0 && tvc.engines[0] != null)
@@ -7369,7 +7770,26 @@ namespace Ternion_FS3.FCS
 				telemetryOpened = true;
 				telemetry = new Telemetry(this);
 			}
-			telemetry?.Write(time, sp, sr, sy, num2);
+			if (telemetry != null)
+			{
+				long tRow0 = System.Diagnostics.Stopwatch.GetTimestamp();
+				pendingRow = CaptureRow(time, sp, sr, sy, num2);   // F-22E 3.0.4 port: finished and written at the top of the next Tick
+				phRow += System.Diagnostics.Stopwatch.GetTimestamp() - tRow0;
+			}
+		}
+
+		// F-22E 3.0.4 port: finish the pending CSV row (the estimator job it waits for is joined first) and hand it to the writer thread
+		private void FlushPendingRow()
+		{
+			if (pendingRow == null)
+			{
+				return;
+			}
+			estJobF?.Join();
+			TelemetryRow r = pendingRow;
+			pendingRow = null;
+			FinishRow(r);
+			telemetry?.Enqueue(r);
 		}
 
 		// Ifrit 0.3.1 (FullStickPitchRate): the pitch-rate cap rises from MaxPitchRate to FullStickPitchRate over the last 20 %
@@ -8369,6 +8789,13 @@ namespace Ternion_FS3.FCS
 			float num = (flag ? Plugin.AoAPos : 999f);
 			float num2 = (flag ? Plugin.AoANeg : (-999f));
 			float num3 = (flag ? Mathf.Min(Mathf.Min(num, asymCapPosEff), authCapEff) : num);
+			// Ternion 0.1.10 (LiveAuthCap): with the asymmetric-load cap in force, also the AoA where the MEASURED nose-down authority
+			// runs out, extrapolated from how it has been falling with AoA in this pull. See LiveAuthStep.
+			LiveAuthStep(dt);
+			if (flag && liveAuthCap < num3)
+			{
+				num3 = liveAuthCap;
+			}
 			float num4 = (flag ? Mathf.Max(Mathf.Max(num2, asymCapNegEff), authCapNegEff) : num2);
 			float num5 = ((Mode == FcsMode.MPO) ? Plugin.MpoGPos : Plugin.GPos);
 			float num6 = ((Mode == FcsMode.MPO) ? Plugin.MpoGNeg : Plugin.GNeg);
@@ -8759,6 +9186,12 @@ namespace Ternion_FS3.FCS
 					{
 						// Compass 0.1.7: less the nose-up the cap's model leaves out (AsymPitchBias)
 						aBrakeTgt = Mathf.Max(AuthBrakeFloor, Mathf.Min(aDn, brDn - (AsymPitchBias ? asymPitchBias : 0f)) * AsymCapBrakeK);
+						// Ternion 0.1.10: and no more than the mean of the nose-down measured now and the one extrapolated to the limit
+						if (liveSlopeOk)
+						{
+							float aAtLim = Mathf.Max(AuthBrakeFloor, aDn + liveSlope * Mathf.Max(0f, num20 - alpha));
+							aBrakeTgt = Mathf.Max(AuthBrakeFloor, Mathf.Min(aBrakeTgt, 0.5f * (aDn + aAtLim)));
+						}
 					}
 					else
 					{
@@ -9530,6 +9963,167 @@ namespace Ternion_FS3.FCS
 
 		internal static bool EngineOutFixedCap = true;
 
+		// Ternion 0.1.9: see the fightK assignment
+		internal static bool FightHintUnpaired = true;
+
+		// Ternion 0.1.9: engine out -> live engine matched to zero thrust above EngineOutAoACap, no AoA cap for it
+		internal static bool EngineOutZeroMatch = true;
+
+		// Ternion 0.1.12: engine-out steady-sideslip trim (see bHold)
+		internal static bool EngineOutSlipTrim = true;
+		internal static float EngineOutSlipTrimTau = 2f;
+		internal static float EngineOutSlipTrimMax = 4f;
+		public float slipTrim;
+
+		// Ternion 0.1.11: latch of the engine-out zero-thrust match, and its release hysteresis (deg)
+		private bool zeroLatch;
+		internal static float EngineOutMatchHyst = 5f;
+
+		// ---- Ternion 0.1.10: live nose-down authority cap ---------------------------------------------------------------------
+		// 9 Nov 09:21 log (right flaperons + right stab gone): a full pull at 615 km/h went 13 -> 117 deg AoA through the 17.6 deg
+		// asymmetric-load cap. The jet's nose-down authority (aDn, measured) fell ~10 deg/s^2 per deg of AoA as the left elevator,
+		// flaperons and canards were taken by the lost wing's roll (aDn 98 at 13 deg, 5 at 23), while the cap's pitch model
+		// (asymCapPitch) still read 26-29 deg until the jet was past the point of no return, and the capture planned its stop with
+		// the braking it had at the start. Bench, same damage, full pulls from 400 / 500 / 615 km/h: all three to 117-123 deg.
+		// Here, while the asymmetric-load cap is in force (damage, no pitch TVC), the slope of aDn against AoA is measured on the way
+		// up (samples 1 deg apart) and the AoA limit is held where aDn extrapolates to AsymPitchMargin, less AsymPitchCapLead,
+		// never under AsymPitchCapFloorNoTvc; the capture brakes with the mean of aDn now and aDn extrapolated to the limit.
+		internal static bool LiveAuthCap = true;
+		internal static float LiveAuthMargin = 60f;   // deg/s^2 of nose-down kept in hand at the limit
+		public float liveAuthCap = 999f;
+		private float liveSlope;
+		private bool liveSlopeOk;
+		private float liveA0 = float.NaN;
+		private float liveD0;
+		private float liveHoldT;
+
+		private void LiveAuthStep(float dt)
+		{
+			bool on = LiveAuthCap && Mode != FcsMode.MPO && asymCapPosEff < Plugin.AoAPos - 0.5f && (tvc == null || tvc.max <= 0.5f || Plugin.DisableTVC);
+			if (!on)
+			{
+				liveAuthCap = 999f;
+				liveSlopeOk = false;
+				liveA0 = float.NaN;
+				return;
+			}
+			if (float.IsNaN(liveA0) || alpha < liveA0 - 1f)
+			{
+				// first sample, or the AoA came back down: start the slope over from here
+				liveA0 = alpha;
+				liveD0 = aDn;
+			}
+			else if (alpha > liveA0 + 1f)
+			{
+				float sl = (aDn - liveD0) / (alpha - liveA0);
+				liveSlope = liveSlopeOk ? Mathf.Lerp(liveSlope, sl, 0.5f) : sl;
+				liveSlopeOk = true;
+				liveA0 = alpha;
+				liveD0 = aDn;
+				liveHoldT = 3f;
+			}
+			liveHoldT -= dt;
+			if (liveHoldT <= 0f)
+			{
+				// no fresh sample for 3 s (holding the AoA): the last estimate lapses
+				liveSlopeOk = false;
+			}
+			float capNew = 999f;
+			if (liveSlopeOk && liveSlope < -1f)
+			{
+				float aZ = alpha + (aDn - LiveAuthMargin) / (0f - liveSlope);
+				capNew = Mathf.Max(AsymPitchCapFloorNoTvc, aZ - AsymPitchCapLead);
+			}
+			// down at once, back up at 5 deg/s
+			liveAuthCap = (capNew < liveAuthCap) ? capNew : Mathf.MoveTowards(liveAuthCap, capNew, 5f * dt);
+		}
+
+		// ---- Ternion 0.1.9: spin recovery ------------------------------------------------------------------------------------
+		// 9 Nov 07:50 log: right flaperons + right stab gone, MPO, a pull to 120 deg AoA settled into an oscillating spin (AoA 40-120,
+		// yaw rate 15-35 deg/s, 40-60 m/s) that neither MPO nor the normal law got out of - the controller held the commanded rates
+		// (zero) with the rudders spent on roll, so the yaw it was meant to stop kept going. Bench (same damage, MPO pull from
+		// 300 km/h, stick released): no recovery in 20 s at any throttle; with the allocator asked for full nose-down and full yaw
+		// against the rotation, roll left to the solve: out in 2.4-3.1 s (AoA < 25, yaw rate < 10), clean or damaged, idle or AB.
+		// Engages while the AoA is past SpinRecAoA with the yaw rate past SpinRecRate for SpinRecDetectT s, the lateral stick and
+		// pedal centred and the pitch stick not held aft (an intended post-stall manoeuvre has the stick in it); ends once the AoA
+		// is under SpinRecExitAoA and the yaw rate under SpinRecExitRate for 0.3 s, or the moment the pilot puts lateral input in.
+		internal static bool SpinRecovery = true;
+		internal static float SpinRecAoA = 40f;
+		internal static float SpinRecRate = 15f;
+		internal static float SpinRecDetectT = 0.8f;
+		internal static float SpinRecExitAoA = 30f;
+		internal static float SpinRecExitRate = 10f;
+		internal static float SpinRecPitchAcc = 300f;
+		internal static float SpinRecYawAcc = 300f;
+		internal static bool SpinRecIdle = true;
+		internal static int SpinRecLaw = 2;         // 0: full nose-down + full yaw against the rotation; 1: rate-damped
+		internal static float SpinRecRollR = 0f;     // law 2: roll rate driven toward -SpinRecRollR x yaw rate
+		internal static float SpinRecRollWeight = 1f;    // allocator roll-axis weight factor while recovering
+		internal static float SpinRecRateK = 6f;     // 1/s: roll / yaw rate damping (deg/s^2 per deg/s), capped at SpinRecYawAcc
+		public bool spinRecOn;
+		private float spinDetT;
+		private float spinExitT;
+
+		private float spinYawSatF;
+		private float spinRDotF;
+		private float spinRPrev;
+		internal static float SpinRecYawSat = 0.5f;
+		internal static float SpinRecDecel = 999f;   // deceleration gate: off (it delayed real spins by 3 s on the bench; the saturation gate alone separates the stop)
+		internal static float SpinRecQMax = 80f;
+
+		// Ternion 0.1.12: the nose-down is a pitch-rate target scheduled on the AoA (full at 30+ deg over the exit AoA, zero 15 deg under it),
+		// not a constant 300 deg/s^2: the 09:52 log's (false) recoveries carried the pitch rate to -33 deg/s and the AoA to -8.
+		private float SpinRecPitchDes(float qD)
+		{
+			float aS = Mathf.Abs(alpha);
+			float qT = (0f - SpinRecQMax) * Mathf.Clamp01((aS - (SpinRecExitAoA - 15f)) / 45f) * Mathf.Sign(alpha);
+			return Mathf.Clamp(SpinRecRateK * (qT - qD), 0f - SpinRecPitchAcc, SpinRecPitchAcc);
+		}
+
+		private void SpinRecStep(float dt)
+		{
+			bool armed = SpinRecovery && Plugin.SpinRecoveryOn && Engaged && !Failed && Mode != FcsMode.Ground && Mode != FcsMode.Off && !wheelsTouch && !isAI;
+			float rDeg = Mathf.Abs(omega.z * 57.29578f);
+			float aAbs = Mathf.Abs(alpha);
+			bool latNeutral = Mathf.Abs(sr) < 0.25f && Mathf.Abs(sy) < 0.25f;
+			if (!armed || !latNeutral)
+			{
+				spinRecOn = false;
+				spinDetT = 0f;
+				spinExitT = 0f;
+				spinRPrev = rDeg;
+				spinRDotF = 0f;
+				spinYawSatF = yawSat;
+				return;
+			}
+			if (!spinRecOn)
+			{
+				// Ternion 0.1.12: only a rotation the controller is NOT stopping. 9 Nov 09:52 log, engine out, rolling pull at 55 deg (yaw
+				// rate 26 = commanded) released at 139.0 / 242.3 s: the stop was taking the yaw rate down 25 -> 15 deg/s with the yaw
+				// surfaces unsaturated (yawSat 0-0.2), and the recovery engaged 0.75 s later and dived the jet (pitch -33 deg/s, AoA 55 -> -8,
+				// 86 deg nose down). Now the yaw must also be saturated (filtered yawSat > SpinRecYawSat) - it is 1 in every spin logged and
+				// benched - and not coming down by more than SpinRecDecel deg/s^2.
+				spinYawSatF += (yawSat - spinYawSatF) * Mathf.Clamp01(dt / 0.3f);
+				float rDotS = (rDeg - spinRPrev) / Mathf.Max(dt, 0.001f);
+				spinRDotF += (rDotS - spinRDotF) * Mathf.Clamp01(dt / 0.3f);
+				spinRPrev = rDeg;
+				bool cond = aAbs > SpinRecAoA && rDeg > SpinRecRate && sp < 0.5f && spinYawSatF > SpinRecYawSat && spinRDotF > 0f - SpinRecDecel;
+				spinDetT = cond ? (spinDetT + dt) : Mathf.Max(0f, spinDetT - 0.5f * dt);   // leaky: a spin's oscillating yaw rate dips under the threshold
+				if (spinDetT > SpinRecDetectT)
+				{
+					spinRecOn = true;
+					spinExitT = 0f;
+				}
+				return;
+			}
+			spinExitT = (aAbs < SpinRecExitAoA && rDeg < SpinRecExitRate) ? (spinExitT + dt) : 0f;
+			if (spinExitT > 0.3f)
+			{
+				spinRecOn = false;
+				spinDetT = 0f;
+			}
+		}
+
 		// 2.0.12: with an engine out the asymmetric-load cap comes down this many times faster (AsymCapTightenRate)
 		internal static float EngOutTightenK = 4f;
 
@@ -10066,6 +10660,7 @@ namespace Ternion_FS3.FCS
 				vmcMatch = false;
 				matchF = 0f;
 				matchFull = false;
+				zeroLatch = false;
 				ThrustMatchClear();
 				return;
 			}
@@ -10088,7 +10683,7 @@ namespace Ternion_FS3.FCS
 			// with a weak (running) engine the run-away is answered by the thrust match, not by cutting both engines
 			// (23 Oct 00:06 F-22E log: both throttled to T/W 0.13 for 5 s at 40-60 m/s): the match holds until the
 			// sideslip has been calm for 2 s
-			bool weakEng = engAbRatio < EngineAsymEnter && !engOut;
+			bool weakEng = (engAbRatio < EngineAsymEnter && !engOut) || (engOut && EngineOutZeroMatch && Plugin.EngineOutZeroThrust);
 			if (runaway && weakEng && Plugin.EngineAbAoAGate && EngineOutFixedCap)
 			{
 				vmcMatch = true;
@@ -10162,6 +10757,12 @@ namespace Ternion_FS3.FCS
 			{
 				inp.throttle = Mathf.Min(inp.throttle, vmcLim);
 			}
+			// Ternion 0.1.9: idle while the spin recovery runs (bench, right flaperons + stab gone: with the afterburner on the nose came
+			// back up at 18-30 deg AoA after the recovery and the jet spun again; at idle it stayed out)
+			if (spinRecOn && SpinRecIdle && Plugin.SpinRecoveryIdle)
+			{
+				inp.throttle = 0f;
+			}
 			if (vmcPredLim < 0.999f)
 			{
 				inp.throttle = Mathf.Min(inp.throttle, vmcPredLim);
@@ -10180,7 +10781,40 @@ namespace Ternion_FS3.FCS
 			bool weak = engAbRatio < EngineAsymEnter;
 			bool gateNeed = Plugin.EngineAbAoAGate && EngineOutFixedCap && (engOut || weak);
 			float tgtF = 0f;
-			if (gateNeed && engOut)
+			if (!(gateNeed && engOut))
+			{
+				zeroLatch = false;
+			}
+			if (gateNeed && engOut && EngineOutZeroMatch && Plugin.EngineOutZeroThrust)
+			{
+				// Ternion 0.1.9: an engine out is matched too - to zero. Timed as the weak-engine match (complete before the AoA gets to
+				// EngineOutAoACap, 1 above it whatever the stick or mode, MPO included), and also on the VMC run-away (measured sideslip
+				// running with the yaw saturated) at any AoA instead of cutting the throttle input. 9 Nov 07:46 log: MPO past 55 deg
+				// held the live engine at military power, the yaw saturated at 57-62 deg and the jet spun before the run-away cut came.
+				// Ternion 0.1.11: the match point is EngineOutMatchAoA (25), not EngineOutAoACap (Tom's 55 = his AoA limit): 9 Nov 09:40 /
+				// 09:41 logs, full stick held, the AoA settled at 40-50 under the 55 limit, the match let go there and the live engine's
+				// thrust came back at 45 deg AoA (yaw rate 10-21 deg/s, yawSat 0.6-0.75, on / off twice in 10 s). Latched: on at the
+				// point (timed as before) or on measured yaw saturation (filtered > 0.5) at any AoA; off only once the AoA is
+				// EngineOutMatchHyst under the point AND the yaw has settled (filtered saturation < 0.2) - no pumping at the limit.
+				float capO = Plugin.EngineOutMatchAoA;
+				float aAbsO = Mathf.Abs(alpha);
+				float spDirO = sp * ((alpha >= 0f) ? 1f : (-1f));
+				float aRateO = alphaDot * ((alpha >= 0f) ? 1f : (-1f));
+				float tCapO = (capO - aAbsO) / Mathf.Max(aRateO, 0.5f);
+				bool onO = aAbsO > capO || (spDirO > 0.15f && (aAbsO > capO - MatchBand || (aRateO > 0.5f && tCapO < MatchLeadTime))) || vmcSatF > 0.5f;
+				if (onO)
+				{
+					zeroLatch = true;
+				}
+				else if (zeroLatch && aAbsO < capO - EngineOutMatchHyst && vmcSatF < 0.2f)
+				{
+					zeroLatch = false;
+				}
+				tgtF = (zeroLatch || vmcMatch) ? 1f : 0f;
+				abGateOn = tgtF > 0.001f || matchF > 0.001f;
+				matchYawOn = false;
+			}
+			else if (gateNeed && engOut)
 			{
 				// an engine out: nothing to match; above EngineOutAoACap the throttle is held at the afterburner's start
 				float capO = Plugin.EngineOutAoACap;
@@ -10228,7 +10862,23 @@ namespace Ternion_FS3.FCS
 				matchYawOn = false;
 				vmcMatch = false;
 			}
-			if (abGateOn && engOut)
+			if (gateNeed && engOut && EngineOutZeroMatch && Plugin.EngineOutZeroThrust)
+			{
+				matchF = Mathf.MoveTowards(matchF, tgtF, ((tgtF > matchF) ? MatchRiseRate : MatchFallRate) * dt);
+				matchFull = matchF >= 0.995f;
+				if (matchF > 0.001f)
+				{
+					// with a loss set the game's nozzles light no afterburner anyway (JetNozzle.Thrust's flag), unless customAxis1 is held:
+					// the throttle input comes off the afterburner with the match as well
+					inp.throttle = Mathf.Min(inp.throttle, Mathf.Lerp(1f, engAbStart, matchF));
+					ThrustZeroApply(matchF);
+				}
+				else
+				{
+					ThrustMatchClear();
+				}
+			}
+			else if (abGateOn && engOut)
 			{
 				inp.throttle = Mathf.Min(inp.throttle, engAbStart);
 				matchF = 0f;
@@ -10299,6 +10949,25 @@ namespace Ternion_FS3.FCS
 						loss = Mathf.Clamp(t0 - target / ratio, 0f, t0) * Mathf.Clamp01(frac);
 					}
 				}
+				Acc.TF_parasitic(eg) = loss;
+				lossMax = Mathf.Max(lossMax, loss);
+			}
+			engMatchLoss = lossMax;
+			matchApplied = true;
+		}
+
+		// Ternion 0.1.9: the live engine(s) matched to a dead one - zero thrust, through parasiticThrustLoss (Turbofan: currentThrust =
+		// max(0, (staticThrust x dynamic factor - loss) x spool), dynamic factor <= 1.2 on this jet); frac ramps it in
+		private void ThrustZeroApply(float frac)
+		{
+			float lossMax = 0f;
+			foreach (Turbofan eg in tvc.engines)
+			{
+				if (eg == null)
+				{
+					continue;
+				}
+				float loss = Acc.TF_operable(eg) ? (1.3f * Mathf.Max(0f, Acc.TF_staticThrust(eg)) * Mathf.Clamp01(frac)) : 0f;
 				Acc.TF_parasitic(eg) = loss;
 				lossMax = Mathf.Max(lossMax, loss);
 			}
@@ -12172,7 +12841,15 @@ namespace Ternion_FS3.FCS
 			// rolling-pull sideslip governor (PullSideslipMargin) still bounds the sideslip.
 			float corkT = (Mode == FcsMode.AoAG && !isAI) ? (Plugin.CorkscrewSlipTol * Mathf.Clamp01((Mathf.Abs(sr) - 0.2f) / 0.5f) * Mathf.InverseLerp(CorkAoA0, CorkAoA0 + 15f, Mathf.Abs(alpha)) * (1f - Mathf.Clamp01(Mathf.Abs(sy) / 0.2f))) : 0f;
 			corkTolNow = (corkT >= corkTolNow) ? corkT : Mathf.MoveTowards(corkTolNow, corkT, CorkTolClose * dt);
-			float bHold = beta - slipPred;
+			// Ternion 0.1.12 (EngineOutSlipTrim): with an engine out, wings level, the rudders holding the thrust yaw also push a steady
+			// sideslip (their side force; zero sideslip would need a few degrees of bank toward the live engine). The proportional hold
+			// answered it with a steady yaw rate: 9 Nov 09:52 log, sticks centred at 60-110 m/s: sideslip +0.5 to +2.3 deg, yaw rate
+			// +0.3 to +3.8 deg/s (rCmd = r, so commanded), the heading creeping. With the sticks centred the steady part of the
+			// sideslip is learned (EngineOutSlipTrimTau) and taken out of the hold, so the jet flies straight with that sideslip;
+			// any stick or pedal, or AoA past 25 deg, lets it go at once (1 s).
+			bool slipTrimOn = EngineOutSlipTrim && (engOut || engAsym) && Mathf.Abs(sr) < 0.05f && Mathf.Abs(sy) < 0.05f && Mathf.Abs(alpha) < 25f && Mode == FcsMode.AoAG;
+			slipTrim = slipTrimOn ? Mathf.Clamp(slipTrim + (beta - slipPred - slipTrim) * Mathf.Clamp01(dt / EngineOutSlipTrimTau), -EngineOutSlipTrimMax, EngineOutSlipTrimMax) : Mathf.MoveTowards(slipTrim, 0f, (EngineOutSlipTrimMax / 1f) * dt);
+			float bHold = beta - slipPred - slipTrim;
 			if (corkTolNow > 0f)
 			{
 				bHold = Mathf.Sign(bHold) * Mathf.Max(0f, Mathf.Abs(bHold) - corkTolNow);
@@ -12232,7 +12909,7 @@ namespace Ternion_FS3.FCS
 
 		public void WriteHeader(TextWriter w)
 		{
-			w.Write("t,mode,ias,tas,rho,alpha,beta,nz,nAlpha,tw,p,q,r,sp,sr,sy,qB,qRaw,qCmd,qT,pCmd,rCmd,aUp,aDn,betaG,alphaCmd,nCmd,unload,prot,omegaV,phi,theta,tvcCmd,tvcNow,nMaxAero,alphaAtNMax,gAvail,gInt,aInt,flapBias,flapTarget,hlPos,relief,rudderAuth,yawSat,aRoll,aYaw,pMax,pStockRef,pFull,rMax,guard,pSmax,pSTarget,latAcc,rS,stabPitchFrac,gndBrake,revFlow,asymDy,asymAr,asymAy,asymU,asymCap,asymCapEff,asymCapNeg,dMeasR,dMeasY,asymCr,asymCy,asymFFr,asymFFy,asymMr,asymMy,asymFFGate,rollPitchFF,gUnder,pitchPrio,stabRateBound,momentLead,rollTrim,aRollPos,aRollNeg,latReserve,aUpPitch,aDnPitch,aBrakeTgt,stabBranch,tvcAnchor,tvcBudget,rudSide,gsRCmd,gsNws,gsRud,gsHold,gsLineY,asymCapPitch,pitchNeed,coupRollLim,rpGate,rpBand,rollGov,rollGovMargin,iasDot,qPredK,asymCapRaw,asymCapFilt,alphaCmdRaw,nCmdRaw,rateBlendAoA,hiRate,rateW,zoneX,authCap,authCapEff,nLiftMax,hybridDMacc,floatOn,floatS,rateBlendAoANeg,nLiftMin,hiSide,authCapNeg,vmcLim,engOut,fuelTrimCm,yawHealth,capIUp,capIDn,capPushU,slipRate,slipGov,yawAnchor,gRateLaw,rateCmdG,negGate,sharedLat,rollGovPred,loadRev,stickLead,capOn,capQ,sweepLim,slatRelief,hlPosNow,slipAlloc,coupGate,pitchLead,slipGovPull,decel,pullTrade,abShare,abTgt,abOpen,fightK,pullFFBoost,tvcdCmd,tvcdNow,splitL,splitR,aRollTvc,pSlipMax,slipGain,droopIn,droopOut,revSense,slipPred,slipHold,splitTier,tvcHold,qTrajV,fightGate,abGate,engAbRatio,engMatchLoss,splitUsage,settledWin,asymThrY,asymLoadY,massKg,nx,capStart,capFlat,capUMin,capULim,gsWheel,gsIndi,gsRdot,gsNu,gsFyK,tvcyCmd,tvcyNow,tvcyHold,canL,canR,flapHL,flapHR,latLag,slipLead,stopSlipLim,stopSlipAB,stopSlipU,stopSlipPred,stopSlipMargin,stopSlipHold,yawSatPitch,yawLead,paceLead,paceHold,slipTol,slipDep,slipAuth,slipStiff,paceRel,tradeAlpha,slipDamp,dampCredit,yawCap,rollGate,rateCap,revSimBeta,revSimT,paceReach" + CapacityEstimator.Header() + ",alphaRoot,betaRoot,airRefCg,alphaCg,betaCg,nuR,nuY,anchR,anchY,unR,unY,gUnmetX,gUnmetZ,paceGateZ,paceGateX,paceMLeft,paceCapZP,paceCapZN,paceCapXP,paceCapXN,capSwp,capShd,aYawShed,ppOn,ppQ,ppReach,rateCapLag,axWr,axWp,axWy,asymPitchBias,asymPitchBiasNeg,asymCapPitchNeg,dmgGate,flapYield,flapSymTgt,vmcPred,vmcPredUse");
+			w.Write("t,mode,ias,tas,rho,alpha,beta,nz,nAlpha,tw,p,q,r,sp,sr,sy,qB,qRaw,qCmd,qT,pCmd,rCmd,aUp,aDn,betaG,alphaCmd,nCmd,unload,prot,omegaV,phi,theta,tvcCmd,tvcNow,nMaxAero,alphaAtNMax,gAvail,gInt,aInt,flapBias,flapTarget,hlPos,relief,rudderAuth,yawSat,aRoll,aYaw,pMax,pStockRef,pFull,rMax,guard,pSmax,pSTarget,latAcc,rS,stabPitchFrac,gndBrake,revFlow,asymDy,asymAr,asymAy,asymU,asymCap,asymCapEff,asymCapNeg,dMeasR,dMeasY,asymCr,asymCy,asymFFr,asymFFy,asymMr,asymMy,asymFFGate,rollPitchFF,gUnder,pitchPrio,stabRateBound,momentLead,rollTrim,aRollPos,aRollNeg,latReserve,aUpPitch,aDnPitch,aBrakeTgt,stabBranch,tvcAnchor,tvcBudget,rudSide,gsRCmd,gsNws,gsRud,gsHold,gsLineY,asymCapPitch,pitchNeed,coupRollLim,rpGate,rpBand,rollGov,rollGovMargin,iasDot,qPredK,asymCapRaw,asymCapFilt,alphaCmdRaw,nCmdRaw,rateBlendAoA,hiRate,rateW,zoneX,authCap,authCapEff,nLiftMax,hybridDMacc,floatOn,floatS,rateBlendAoANeg,nLiftMin,hiSide,authCapNeg,vmcLim,engOut,fuelTrimCm,yawHealth,capIUp,capIDn,capPushU,slipRate,slipGov,yawAnchor,gRateLaw,rateCmdG,negGate,sharedLat,rollGovPred,loadRev,stickLead,capOn,capQ,sweepLim,slatRelief,hlPosNow,slipAlloc,coupGate,pitchLead,slipGovPull,decel,pullTrade,abShare,abTgt,abOpen,fightK,pullFFBoost,tvcdCmd,tvcdNow,splitL,splitR,aRollTvc,pSlipMax,slipGain,droopIn,droopOut,revSense,slipPred,slipHold,splitTier,tvcHold,qTrajV,fightGate,abGate,engAbRatio,engMatchLoss,splitUsage,settledWin,asymThrY,asymLoadY,massKg,nx,capStart,capFlat,capUMin,capULim,gsWheel,gsIndi,gsRdot,gsNu,gsFyK,tvcyCmd,tvcyNow,tvcyHold,canL,canR,flapHL,flapHR,latLag,slipLead,stopSlipLim,stopSlipAB,stopSlipU,stopSlipPred,stopSlipMargin,stopSlipHold,yawSatPitch,yawLead,paceLead,paceHold,slipTol,slipDep,slipAuth,slipStiff,paceRel,tradeAlpha,slipDamp,dampCredit,yawCap,rollGate,rateCap,revSimBeta,revSimT,paceReach" + CapacityEstimator.Header() + ",alphaRoot,betaRoot,airRefCg,alphaCg,betaCg,nuR,nuY,anchR,anchY,unR,unY,gUnmetX,gUnmetZ,paceGateZ,paceGateX,paceMLeft,paceCapZP,paceCapZN,paceCapXP,paceCapXN,capSwp,capShd,aYawShed,ppOn,ppQ,ppReach,rateCapLag,axWr,axWp,axWy,asymPitchBias,asymPitchBiasNeg,asymCapPitchNeg,dmgGate,flapYield,flapSymTgt,vmcPred,vmcPredUse,spinRec,matchF,fightHintOff,fcsUs,estWaitUs,estThr,tRebUs,tAllocUs,tKickUs,tRowUs,tLawUs,tAsymUs,tAsymMomUs,tSlipUs,tSweepUs,tEnvUs,tMassUs,tFlapUs,tGndUs,tVmcUs");
 			foreach (SurfaceEffector surface in surfaces)
 			{
 				w.Write("," + surface.name + "_cmd," + surface.name + "_now," + surface.name + "_aoaNow," + surface.name + "_aoaCmd");
@@ -12240,30 +12917,33 @@ namespace Ternion_FS3.FCS
 			w.WriteLine();
 		}
 
-		public void WriteRow(TextWriter w, float t, float spv, float srv, float syv, float rho)
-		{
-			CultureInfo invariantCulture = CultureInfo.InvariantCulture;
-			w.Write(string.Format(invariantCulture, "{0:F3},{1},{2:F1},{3:F1},{4:F3},{5:F2},{6:F2},{7:F2},{8:F3},{9:F2},{10:F1},{11:F1},{12:F1},{13:F2},{14:F2},{15:F2},{16:F1},{17:F1},{18:F1},{19:F1},{20:F1},{21:F1},{22:F0},{23:F0},{24:F2},{25:F1},{26:F2},{27},{28},{29:F1},{30:F1},{31:F1},{32:F2},{33:F2}", t, (int)Mode, ias, tas, rho, alpha, beta, nz, nAlpha, tw, omega.x * 57.29578f, omega.y * 57.29578f, omega.z * 57.29578f, spv, srv, syv, qB, qRaw, qCmd, qT, pCmd, rCmd, aUp, aDn, betaG, alphaCmd, nCmd, unload ? 1 : 0, prot ? 1 : 0, omegaV, phi, theta, tvc.cmd, tvc.now));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F0},{2:F2},{3:F2},{4:F2},{5:F1},{6:F1},{7:F2},{8:F1},{9:F2},{10:F2},{11:F0},{12:F0}", nMaxAero, alphaAtNMax, gAvail, gInt, aInt, flaps.flapBias, flaps.flapTarget, flaps.hlPos, flaps.relief, rudderAuth, yawSat, aRoll, aYaw));
-			w.Write(string.Format(invariantCulture, ",{0:F0},{1:F0},{2:F0},{3:F0},{4:F2},{5:F0},{6:F0},{7:F0},{8:F1},{9:F2}", pMaxDbg, pStockRef, pFull, rMaxDbg, guardDbg, pSmaxDbg, pSTgtDbg, latAccDbg, rSDbg, stabPitchFrac));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1}", groundBrake, revFlow ? 1 : 0));
-			w.Write(string.Format(invariantCulture, ",{0:F3},{1:F1},{2:F1},{3:F2},{4:F1},{5:F1},{6:F1},{7:F1},{8:F1}", asymDy, asymArNow, asymAyNow, asymUNow, Mathf.Min(asymCapPos, 999f), Mathf.Min(asymCapPosEff, 999f), Mathf.Max(asymCapNegEff, -999f), dMeasR, dMeasY));
-			w.Write(string.Format(invariantCulture, ",{0:F0},{1:F0},{2:F1},{3:F1},{4:F1},{5:F1}", asymCrNow, asymCyNow, asymFFr, asymFFy, AccRoll(asymMNow), AccYaw(asymMNow)));
-			w.Write(string.Format(invariantCulture, ",{0:F2}", asymFFGate));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1}", rollPitchFF * IaInv[1, 1] * 57.29578f, gUnderDbg));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1},{2:F2},{3:F0},{4:F0},{5:F0},{6:F2},{7:F0},{8:F0},{9:F0},{10}", pitchPrio, stabRateBound ? 1 : 0, mLeadGate * mLeadAgree, dTrimR, aRollPos, aRollNeg, latReserve, aUpPitch, aDnPitch, aBrakeTgt, stabBranch));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F1}", tvcAnchor, tvcBudgetGate, rudSideDbg));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3},{4:F2},{5:F1},{6:F2},{7:F0}", gsRCmd, gsNwsDeg, gsRud, gsHold ? 1 : 0, gsLineY, Mathf.Min(asymCapPitch, 999f), pitchNeed, coupRollLim));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F1},{2:F2},{3:F2}", rpGate, rpBand, rollGov, rollGovMargin));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F3},{2:F1},{3:F1}", iasDotF, qPredK, Mathf.Clamp(asymCapPos, -99f, 99f), Mathf.Clamp(asymCapFilt, -99f, 99f)));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F2},{2:F1},{3},{4:F2},{5:F2},{6:F1},{7:F1},{8:F2},{9:F1}", alphaCmdRaw, nCmdRaw, rateBlendAoA, hiRate ? 1 : 0, rateW, zoneX, Mathf.Min(authCap, 99f), Mathf.Min(authCapEff, 99f), nLiftMax, hybridDM * IaInv[1, 1] * 57.29578f));
-			w.Write(string.Format(invariantCulture, ",{0},{1:F2}", floatOn ? 1 : 0, floatS));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F2},{2},{3:F1}", rateBlendAoANeg, nLiftMin, hiRate ? hiSide : 0, Mathf.Max(authCapNegEff, -99f)));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1},{2:F1},{3:F2}", vmcLim, engOut ? 1 : (engAsym ? 2 : 0), fuelTrimOn ? (fuelTrimDelta * 100f) : 0f, yawHealth));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2}", capIUp, capIDn, capPushU));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F2},{2:F1},{3},{4:F1}", slipRateDbg, slipGovDbg, Mathf.Clamp(yawAnchorDbg, -999f, 999f), Plugin.GRateLaw ? 1 : 0, rateCmdG));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2},{5},{6:F1},{7:F1},{8:F2},{9:F2},{10:F2},{11:F2}", negGateDbg, sharedLatDbg, rollGovPredDbg, loadRevDbg, stickLeadDbg, capOn ? 1 : 0, capQ, sweepLimDbg, slatRelief, flaps != null ? flaps.hlPos : 0f, (YawPrioHi > 0f && Plugin.SlipYawWeightOn) ? YawHiSlipGate() * Mathf.Clamp01((Mathf.Abs(alpha) - 20f) / 20f) : 0f, coupGateHeld));
-			w.Write(string.Format(invariantCulture, ",{0:F3},{1:F2},{2:F2},{3:F0},{4:F3},{5:F2},{6:F2},{7:F2},{8:F2}", pitchLeadDbg, slipGovPullDbg, decelDbg, pullTradeDbg, airbrakeShare, AirbrakeOpenTarget, airbrakeOpenNow, alloc.fightK, pullFFBoost));
+		// F-22E 3.0.4 port: WriteRow split in two. CaptureRow runs at the end of tick N on the main thread and boxes every value, in the same
+		// order and with the same format strings as WriteRow did; the estimator's columns and the reach count (which includes the probes'
+		// re-solves) are slots that FinishRow fills at the top of tick N+1, once the estimator job of tick N is joined. The text is made by
+		// TelemetryRow.WriteTo on the writer thread: string.Format(InvariantCulture, fmt, args) per part, as before.
+		private TelemetryRow CaptureRow(float t, float spv, float srv, float syv, float rho){
+			TelemetryRow r = new TelemetryRow();
+			r.Add("{0:F3},{1},{2:F1},{3:F1},{4:F3},{5:F2},{6:F2},{7:F2},{8:F3},{9:F2},{10:F1},{11:F1},{12:F1},{13:F2},{14:F2},{15:F2},{16:F1},{17:F1},{18:F1},{19:F1},{20:F1},{21:F1},{22:F0},{23:F0},{24:F2},{25:F1},{26:F2},{27},{28},{29:F1},{30:F1},{31:F1},{32:F2},{33:F2}", t, (int)Mode, ias, tas, rho, alpha, beta, nz, nAlpha, tw, omega.x * 57.29578f, omega.y * 57.29578f, omega.z * 57.29578f, spv, srv, syv, qB, qRaw, qCmd, qT, pCmd, rCmd, aUp, aDn, betaG, alphaCmd, nCmd, unload ? 1 : 0, prot ? 1 : 0, omegaV, phi, theta, tvc.cmd, tvc.now);
+			r.Add(",{0:F2},{1:F0},{2:F2},{3:F2},{4:F2},{5:F1},{6:F1},{7:F2},{8:F1},{9:F2},{10:F2},{11:F0},{12:F0}", nMaxAero, alphaAtNMax, gAvail, gInt, aInt, flaps.flapBias, flaps.flapTarget, flaps.hlPos, flaps.relief, rudderAuth, yawSat, aRoll, aYaw);
+			r.Add(",{0:F0},{1:F0},{2:F0},{3:F0},{4:F2},{5:F0},{6:F0},{7:F0},{8:F1},{9:F2}", pMaxDbg, pStockRef, pFull, rMaxDbg, guardDbg, pSmaxDbg, pSTgtDbg, latAccDbg, rSDbg, stabPitchFrac);
+			r.Add(",{0:F2},{1}", groundBrake, revFlow ? 1 : 0);
+			r.Add(",{0:F3},{1:F1},{2:F1},{3:F2},{4:F1},{5:F1},{6:F1},{7:F1},{8:F1}", asymDy, asymArNow, asymAyNow, asymUNow, Mathf.Min(asymCapPos, 999f), Mathf.Min(asymCapPosEff, 999f), Mathf.Max(asymCapNegEff, -999f), dMeasR, dMeasY);
+			r.Add(",{0:F0},{1:F0},{2:F1},{3:F1},{4:F1},{5:F1}", asymCrNow, asymCyNow, asymFFr, asymFFy, AccRoll(asymMNow), AccYaw(asymMNow));
+			r.Add(",{0:F2}", asymFFGate);
+			r.Add(",{0:F1},{1:F1}", rollPitchFF * IaInv[1, 1] * 57.29578f, gUnderDbg);
+			r.Add(",{0:F1},{1},{2:F2},{3:F0},{4:F0},{5:F0},{6:F2},{7:F0},{8:F0},{9:F0},{10}", pitchPrio, stabRateBound ? 1 : 0, mLeadGate * mLeadAgree, dTrimR, aRollPos, aRollNeg, latReserve, aUpPitch, aDnPitch, aBrakeTgt, stabBranch);
+			r.Add(",{0:F2},{1:F2},{2:F1}", tvcAnchor, tvcBudgetGate, rudSideDbg);
+			r.Add(",{0:F2},{1:F2},{2:F2},{3},{4:F2},{5:F1},{6:F2},{7:F0}", gsRCmd, gsNwsDeg, gsRud, gsHold ? 1 : 0, gsLineY, Mathf.Min(asymCapPitch, 999f), pitchNeed, coupRollLim);
+			r.Add(",{0:F2},{1:F1},{2:F2},{3:F2}", rpGate, rpBand, rollGov, rollGovMargin);
+			r.Add(",{0:F2},{1:F3},{2:F1},{3:F1}", iasDotF, qPredK, Mathf.Clamp(asymCapPos, -99f, 99f), Mathf.Clamp(asymCapFilt, -99f, 99f));
+			r.Add(",{0:F1},{1:F2},{2:F1},{3},{4:F2},{5:F2},{6:F1},{7:F1},{8:F2},{9:F1}", alphaCmdRaw, nCmdRaw, rateBlendAoA, hiRate ? 1 : 0, rateW, zoneX, Mathf.Min(authCap, 99f), Mathf.Min(authCapEff, 99f), nLiftMax, hybridDM * IaInv[1, 1] * 57.29578f);
+			r.Add(",{0},{1:F2}", floatOn ? 1 : 0, floatS);
+			r.Add(",{0:F1},{1:F2},{2},{3:F1}", rateBlendAoANeg, nLiftMin, hiRate ? hiSide : 0, Mathf.Max(authCapNegEff, -99f));
+			r.Add(",{0:F2},{1},{2:F1},{3:F2}", vmcLim, engOut ? 1 : (engAsym ? 2 : 0), fuelTrimOn ? (fuelTrimDelta * 100f) : 0f, yawHealth);
+			r.Add(",{0:F2},{1:F2},{2:F2}", capIUp, capIDn, capPushU);
+			r.Add(",{0:F1},{1:F2},{2:F1},{3},{4:F1}", slipRateDbg, slipGovDbg, Mathf.Clamp(yawAnchorDbg, -999f, 999f), Plugin.GRateLaw ? 1 : 0, rateCmdG);
+			r.Add(",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2},{5},{6:F1},{7:F1},{8:F2},{9:F2},{10:F2},{11:F2}", negGateDbg, sharedLatDbg, rollGovPredDbg, loadRevDbg, stickLeadDbg, capOn ? 1 : 0, capQ, sweepLimDbg, slatRelief, flaps != null ? flaps.hlPos : 0f, (YawPrioHi > 0f && Plugin.SlipYawWeightOn) ? YawHiSlipGate() * Mathf.Clamp01((Mathf.Abs(alpha) - 20f) / 20f) : 0f, coupGateHeld);
+			r.Add(",{0:F3},{1:F2},{2:F2},{3:F0},{4:F3},{5:F2},{6:F2},{7:F2},{8:F2}", pitchLeadDbg, slipGovPullDbg, decelDbg, pullTradeDbg, airbrakeShare, AirbrakeOpenTarget, airbrakeOpenNow, alloc.fightK, pullFFBoost);
 			// Ifrit 0.3.0: roll TVC, the split decelerons (physical deg), the sideslip assist and the flaperon droop
 			float spLog = 0f;
 			float spRog = 0f;
@@ -12279,24 +12959,24 @@ namespace Ternion_FS3.FCS
 					spRog = ph;
 				}
 			}
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F1},{3:F1},{4:F0},{5:F0},{6:F2},{7:F1},{8:F1}", (tvcd != null) ? tvcd.cmdOut : 0f, (tvcd != null) ? tvcd.now : 0f, spLog, spRog, aRollTvc, pSlipMax, slipGainDbg, (flaps != null) ? flaps.innerDroop : 0f, (flaps != null) ? flaps.outerDroop : 0f));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2},{5:F1},{6:F2},{7:F2},{8:F2},{9:F2},{10:F2},{11}", revSenseDbg, slipPredDbg, slipHoldDbg, splitTierDbg, tvcNeutralDbg, qTraj.v, fightGateDbg, abGateOn ? ((engOut || matchF <= 0f) ? 1f : matchF) : 0f, engAbRatio, engMatchLoss * 0.001f, splitUsage, settledWinDbg ? 1 : 0));
+			r.Add(",{0:F2},{1:F2},{2:F1},{3:F1},{4:F0},{5:F0},{6:F2},{7:F1},{8:F1}", (tvcd != null) ? tvcd.cmdOut : 0f, (tvcd != null) ? tvcd.now : 0f, spLog, spRog, aRollTvc, pSlipMax, slipGainDbg, (flaps != null) ? flaps.innerDroop : 0f, (flaps != null) ? flaps.outerDroop : 0f);
+			r.Add(",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2},{5:F1},{6:F2},{7:F2},{8:F2},{9:F2},{10:F2},{11}", revSenseDbg, slipPredDbg, slipHoldDbg, splitTierDbg, tvcNeutralDbg, qTraj.v, fightGateDbg, abGateOn ? ((engOut || matchF <= 0f) ? 1f : matchF) : 0f, engAbRatio, engMatchLoss * 0.001f, splitUsage, settledWinDbg ? 1 : 0);
 			float thrY = (tvc != null && tvc.active) ? AccYaw(((tvcd != null && tvcd.active) || (tvcy != null && tvcy.active)) ? tvc.MAt(tvc.now) : tvc.Mnow) : ((tvc != null) ? AccYaw(FixedThrustLat()) : 0f);
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F1},{3:F3}", thrY, dMeasY + thrY, mass, nxDbg));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1},{2:F2},{3:F2}", AsymCap.DbgStart, AsymCap.DbgFlat, AsymCap.DbgUMin, AsymCap.DbgULim));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1},{2:F1},{3:F1},{4:F2}", gsWheelDbg, gsIndiOn ? 1 : 0, gsRdotF, gsNuDbg, gsFyF * 0.001f));
+			r.Add(",{0:F2},{1:F2},{2:F1},{3:F3}", thrY, dMeasY + thrY, mass, nxDbg);
+			r.Add(",{0:F1},{1:F1},{2:F2},{3:F2}", AsymCap.DbgStart, AsymCap.DbgFlat, AsymCap.DbgUMin, AsymCap.DbgULim);
+			r.Add(",{0:F2},{1},{2:F1},{3:F1},{4:F2}", gsWheelDbg, gsIndiOn ? 1 : 0, gsRdotF, gsNuDbg, gsFyF * 0.001f);
 			// Revoker 0.1.0: yaw nozzle command / angle / neutral-hold weight, and the two canards' deflection
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2}", (tvcy != null) ? tvcy.cmdOut : 0f, (tvcy != null) ? tvcy.now : 0f, tvcYawNeutralW, (surfaces.Count > 0) ? surfaces[0].now : 0f, (surfaces.Count > 1) ? surfaces[1].now : 0f));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2}", (hinges.Count > 0) ? hinges.Find((HingeFlapEffector h) => h.left)?.hingeNow ?? 0f : 0f, (hinges.Count > 0) ? hinges.Find((HingeFlapEffector h) => !h.left)?.hingeNow ?? 0f : 0f));
+			r.Add(",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2}", (tvcy != null) ? tvcy.cmdOut : 0f, (tvcy != null) ? tvcy.now : 0f, tvcYawNeutralW, (surfaces.Count > 0) ? surfaces[0].now : 0f, (surfaces.Count > 1) ? surfaces[1].now : 0f);
+			r.Add(",{0:F2},{1:F2}", (hinges.Count > 0) ? hinges.Find((HingeFlapEffector h) => h.left)?.hingeNow ?? 0f : 0f, (hinges.Count > 0) ? hinges.Find((HingeFlapEffector h) => !h.left)?.hingeNow ?? 0f : 0f);
 			// Revoker 0.2.15: the lateral loops' answer lag (s) and the governor's look-ahead (s)
-			w.Write(string.Format(invariantCulture, ",{0:F3},{1:F3}", latLagEff, slipLeadDbg));
-			w.Write(string.Format(invariantCulture, ",{0:F0},{1:F0},{2:F2},{3:F2},{4:F1},{5:F2},{6:F1},{7:F3}", Mathf.Min(stopSlipLimDbg, 999f), stopSlipABDbg, stopSlipUDbg, stopSlipPredDbg, stopSlipMarginDbg, stopSlipHoldDbg, yawSatPitchDbg, yawLeadDbg));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1},{2:F1},{3:F1},{4:F1},{5:F2},{6:F2},{7:F1}", paceLeadDbg, paceHoldDbg, slipTolDbg, slipDepDbg, slipAuthDbg, slipStiffDbg, paceRelDbg, tradeAlphaDbg));
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F0}", slipDampDbg, dampCredit));
-			w.Write(string.Format(invariantCulture, ",{0:F0},{1:F2}", yawCapDbg, rollLoadDbg));
-			w.Write(string.Format(invariantCulture, ",{0:F0},{1:F2},{2:F2},{3:F1}", Mathf.Min(dbgRateCap, 9999f), revSimBetaDbg, revSimTDbg, paceReachDbg));
-			capEst.Row(w, invariantCulture);
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2},{3:F2},{4:F2}", alphaRoot, betaRoot, AirDataAtCg ? 1 : 0, alphaCgDbg, betaCgDbg));
+			r.Add(",{0:F3},{1:F3}", latLagEff, slipLeadDbg);
+			r.Add(",{0:F0},{1:F0},{2:F2},{3:F2},{4:F1},{5:F2},{6:F1},{7:F3}", Mathf.Min(stopSlipLimDbg, 999f), stopSlipABDbg, stopSlipUDbg, stopSlipPredDbg, stopSlipMarginDbg, stopSlipHoldDbg, yawSatPitchDbg, yawLeadDbg);
+			r.Add(",{0:F1},{1:F1},{2:F1},{3:F1},{4:F1},{5:F2},{6:F2},{7:F1}", paceLeadDbg, paceHoldDbg, slipTolDbg, slipDepDbg, slipAuthDbg, slipStiffDbg, paceRelDbg, tradeAlphaDbg);
+			r.Add(",{0:F2},{1:F0}", slipDampDbg, dampCredit);
+			r.Add(",{0:F0},{1:F2}", yawCapDbg, rollLoadDbg);
+			r.Add(",{0:F0},{1:F2},{2:F2},{3:F1}", Mathf.Min(dbgRateCap, 9999f), revSimBetaDbg, revSimTDbg, paceReachDbg);
+			r.ceA = r.Slot();   // F-22E 3.0.4 port: the estimator's columns (capEst.Row), filled in FinishRow after the join
+			r.Add(",{0:F2},{1:F2},{2},{3:F2},{4:F2}", alphaRoot, betaRoot, AirDataAtCg ? 1 : 0, alphaCgDbg, betaCgDbg);
 			// Revoker 0.8.2: what the roll / yaw rate loops ask for (deg/s^2; ~0 with the stick centred once the jet holds its command),
 			// how far the tables' roll / yaw columns were off their live moment this tick before anchoring (deg/s^2, summed), and what
 			// the allocation left unmade of its target (deg/s^2, the main solve)
@@ -12316,20 +12996,54 @@ namespace Ternion_FS3.FCS
 						anchSum += hA.anchorDbg;
 					}
 				}
-				w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2},{5:F2}", omegaDotDes.x * 57.29578f, omegaDotDes.z * 57.29578f, anchSum.x * IaInv[0, 0] * 57.29578f, anchSum.z * IaInv[2, 2] * 57.29578f, -allocResMain.x, -allocResMain.z));
+				r.Add(",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2},{5:F2}", omegaDotDes.x * 57.29578f, omegaDotDes.z * 57.29578f, anchSum.x * IaInv[0, 0] * 57.29578f, anchSum.z * IaInv[2, 2] * 57.29578f, -allocResMain.x, -allocResMain.z);
 			}
 			// 0.6.0: the governor port's columns (F-22E 3.0.0): the allocator's unmet (filtered), the pace window's gates, margin left and
 			// capacities, the push governor's caps, the push plan, the reach-pass re-solves, the rate cap's servo lag, the axis weights
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1},{2:F2},{3:F2},{4:F1},{5:F0},{6:F0},{7:F0},{8:F0}", allocUnmet.x, allocUnmet.z, paceGateZDbg, paceGateXDbg, paceMLeftDbg, paceCapZPDbg, paceCapZNDbg, paceCapXPDbg, paceCapXNDbg));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1},{2:F1},{3},{4:F1},{5}", capSweepDbg, Mathf.Clamp(capShedDbg, -999f, 999f), aYawShedDbg, pushPlanOn ? 1 : 0, pushPlanOn ? pushPlanQNow : 0f, alloc.reachMoves - reachLogPrev));
-			reachLogPrev = alloc.reachMoves;
-			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3:F2}", rateCapLagDbg, axWDbg.x, axWDbg.y, axWDbg.z));
-			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1},{2:F1},{3:F0},{4:F2},{5:F1},{6:F2},{7:F2}", asymPitchBias, asymPitchBiasNeg, Mathf.Max(asymCapPitchNeg, -999f), dmgGateHold, flapDiffYield, (hinges.Count > 0) ? hinges[0].symTarget : 0f, vmcPredLim, vmcPredUse));
+			r.Add(",{0:F1},{1:F1},{2:F2},{3:F2},{4:F1},{5:F0},{6:F0},{7:F0},{8:F0}", allocUnmet.x, allocUnmet.z, paceGateZDbg, paceGateXDbg, paceMLeftDbg, paceCapZPDbg, paceCapZNDbg, paceCapXPDbg, paceCapXNDbg);
+			r.Add(",{0:F1},{1:F1},{2:F1},{3},{4:F1}", capSweepDbg, Mathf.Clamp(capShedDbg, -999f, 999f), aYawShedDbg, pushPlanOn ? 1 : 0, pushPlanOn ? pushPlanQNow : 0f);
+			r.reachSlot = r.Slot();   // F-22E 3.0.4 port: the reach-pass re-solves since the last row, filled in FinishRow
+			r.reachMain = alloc.reachMoves;
+			r.Add(",{0:F2},{1:F2},{2:F2},{3:F2}", rateCapLagDbg, axWDbg.x, axWDbg.y, axWDbg.z);
+			r.Add(",{0:F1},{1:F1},{2:F1},{3:F0},{4:F2},{5:F1},{6:F2},{7:F2}", asymPitchBias, asymPitchBiasNeg, Mathf.Max(asymCapPitchNeg, -999f), dmgGateHold, flapDiffYield, (hinges.Count > 0) ? hinges[0].symTarget : 0f, vmcPredLim, vmcPredUse);
+			r.Add(",{0},{1:F2},{2}", spinRecOn ? 1 : 0, matchF, alloc.fightHintOff ? 1 : 0);
+			r.timeSlot = r.Slot();   // F-22E 3.0.4 port: fcsUs, estWaitUs, estThr, tRebUs..tRowUs
+			r.timeSlot2 = r.Slot();   // tLawUs..tVmcUs
+			r.threaded = estJobF != null && estJobF.Pending;
 			foreach (SurfaceEffector surface in surfaces)
 			{
-				w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F1},{3:F1}", surface.cmd, surface.now, surface.localAoANow, surface.localAoACmd));
+				r.Add(",{0:F2},{1:F2},{2:F1},{3:F1}", surface.cmd, surface.now, surface.localAoANow, surface.localAoACmd);
 			}
-			w.WriteLine();
+			return r;
+		}
+
+		// the bench's own flight log (and any synchronous use): this tick's row, written now (the estimator joined first)
+		public void WriteRow(TextWriter w, float t, float spv, float srv, float syv, float rho)
+		{
+			estJobF?.Join();
+			TelemetryRow r = CaptureRow(t, spv, srv, syv, rho);
+			// its own reach-count baseline, so a synchronous log beside the game's (the bench) counts as the only writer did
+			int keep = reachLogPrev;
+			reachLogPrev = reachLogPrevSync;
+			FinishRow(r);
+			reachLogPrevSync = reachLogPrev;
+			reachLogPrev = keep;
+			r.WriteTo(w);
+		}
+
+		private int reachLogPrevSync;
+
+		private void FinishRow(TelemetryRow r)
+		{
+			TelemetryRow ceRow = new TelemetryRow();
+			capEst.RowTo(ceRow);
+			r.FillSub(r.ceA, ceRow);
+			// the main allocator's count at capture (tick N's real solves; in the synchronous path also its probes) + the worker's probes
+			int reachTot = r.reachMain + ((estJobF != null) ? estJobF.WorkerReachMoves : 0);
+			r.Fill(r.reachSlot, ",{0}", reachTot - reachLogPrev);
+			reachLogPrev = reachTot;
+			r.Fill(r.timeSlot, ",{0:F0},{1:F0},{2},{3:F0},{4:F0},{5:F0},{6:F0}", lastTickUs, r.threaded ? estJobF.lastWaitUs : 0f, r.threaded ? 1 : 0, TicksToUs(phRebuild), TicksToUs(phAlloc), TicksToUs(phKick), TicksToUs(phRow));
+			r.Fill(r.timeSlot2, ",{0:F0},{1:F0},{2:F0},{3:F0},{4:F0},{5:F0},{6:F0},{7:F0},{8:F0},{9:F0}", TicksToUs(phLaws), TicksToUs(phAsym), TicksToUs(phAsymMom), TicksToUs(phSlip), TicksToUs(phSweep), TicksToUs(phEnv), TicksToUs(phMass), TicksToUs(phFlaps), TicksToUs(phGround), TicksToUs(phVmc));
 		}
 	}
 }

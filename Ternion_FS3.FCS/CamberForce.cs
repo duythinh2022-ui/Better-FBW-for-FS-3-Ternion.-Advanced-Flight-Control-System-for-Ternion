@@ -92,7 +92,20 @@ namespace Ternion_FS3.FCS
 			return (c != null) ? c.surfs.Count : 0;
 		}
 
+		// F-22E 3.1.3: timed for the TickTimerLog line (this force hook runs in the game's FixedUpdate, outside the FCS tick)
 		private void FixedUpdate()
+		{
+			if (!Plugin.TickTimerLog)
+			{
+				FixedUpdateBody();
+				return;
+			}
+			long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+			FixedUpdateBody();
+			HookTimer.Note(1, (UnityEngine.Object)(object)ac != null && (UnityEngine.Object)(object)ac.Player != null, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+		}
+
+		private void FixedUpdateBody()
 		{
 			if ((Object)(object)ac == null)
 			{
